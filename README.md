@@ -211,6 +211,16 @@ pio run --target upload
 pio device monitor
 ```
 
+## Acknowledgements
+
+This project was inspired by and built with knowledge from the following open source projects:
+
+- **[EdgeTX](https://github.com/EdgeTX/edgetx)** — open source firmware for RC radio transmitters, whose BLE trainer and telemetry protocols are implemented here.
+- **[BTWifiModule](https://github.com/olliw42/btWifiModule)** — ESP32-based BT/WiFi module reference, which influenced the AT command handling and FrSky BLE protocol implementation.
+- **[HeadTracker](https://github.com/dlktdr/HeadTracker)** — open source head tracker project, which provided insight into the BLE channel data format and PPM output used as input source.
+
 ## License
 
-MIT
+This project is open source, released under the [MIT License](LICENSE).
+
+You are free to use, modify, and distribute this software for any purpose, including commercial use, as long as the original license notice is retained.
