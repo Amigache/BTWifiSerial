@@ -107,14 +107,20 @@ void sbusInit() {
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
     ESP_ERROR_CHECK(uart_driver_install(UART_NUM_1, 256, 256, 0, NULL, 0));
 
-    // Invert TX signal for SBUS
+    // Invert TX signal for SBUS (hardware inversion)
+    // If the radio's AUX port already has a hardware inverter (e.g. TX16S),
+    // set SBUS_HW_INVERT to 0 in platformio.ini build_flags to disable.
+#if !defined(SBUS_HW_INVERT) || SBUS_HW_INVERT != 0
     ESP_ERROR_CHECK(uart_set_line_inverse(UART_NUM_1, UART_SIGNAL_TXD_INV));
+    LOG_I("SBUS", "Initialized: TX=%d RX=%d @ %lu baud (8E2 inverted)",
+          PIN_SERIAL_TX, PIN_SERIAL_RX, SBUS_BAUD);
+#else
+    LOG_I("SBUS", "Initialized: TX=%d RX=%d @ %lu baud (8E2 NOT inverted)",
+          PIN_SERIAL_TX, PIN_SERIAL_RX, SBUS_BAUD);
+#endif
 
     s_running     = true;
     s_lastFrameMs = 0;
-
-    LOG_I("SBUS", "Initialized: TX=%d RX=%d @ %lu baud (8E2 inverted)",
-          PIN_SERIAL_TX, PIN_SERIAL_RX, SBUS_BAUD);
 }
 
 void sbusLoop() {
