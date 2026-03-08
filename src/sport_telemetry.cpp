@@ -143,10 +143,19 @@ static void processAtCommand(const char* cmd) {
 
 /**
  * @brief Forward a parsed S.PORT packet to the selected output.
+ * Also updates PPS stats so the counter works regardless of who calls.
  */
 static void forwardPacket(const SportPacket* pkt) {
     s_packetCount++;
     s_ppsCount++;
+
+    // Update packets-per-second (can be called from any path)
+    uint32_t nowSec = millis() / 1000;
+    if (nowSec != s_lastPpsSec) {
+        s_ppsValue   = s_ppsCount - 1;  // exclude the packet we just counted
+        s_ppsCount   = 1;
+        s_lastPpsSec = nowSec;
+    }
 
     if (g_config.telemetryOutput == TelemetryOutput::WIFI_UDP && s_udpActive) {
         // Send raw 8-byte packet as UDP datagram
@@ -381,9 +390,6 @@ static void rawRxProcessByte(uint8_t data) {
 // WiFi AP + UDP MANAGEMENT
 // ═══════════════════════════════════════════════════════════════════
 
-static const char* SPORT_AP_SSID = "BTWifiSerial";
-static const char* SPORT_AP_PASS = "12345678";
-
 static void startWiFiAP() {
     if (s_wifiStarted) return;
 
@@ -391,7 +397,7 @@ static void startWiFiAP() {
     WiFi.mode(WIFI_AP);
     delay(100);
 
-    if (!WiFi.softAP(SPORT_AP_SSID, SPORT_AP_PASS, 1, 0, 4)) {
+    if (!WiFi.softAP(g_config.apSsid, g_config.apPass, 1, 0, 4)) {
         LOG_E("SPORT", "softAP() failed!");
         WiFi.mode(WIFI_OFF);
         return;
@@ -412,7 +418,7 @@ static void startWiFiAP() {
     s_wifiStarted = true;
 
     LOG_I("SPORT", "AP started: SSID=%s IP=%s UDP port=%u",
-          SPORT_AP_SSID, WiFi.softAPIP().toString().c_str(), g_config.udpPort);
+          g_config.apSsid, WiFi.softAPIP().toString().c_str(), g_config.udpPort);
 }
 
 static void stopWiFiAP() {
@@ -485,13 +491,6 @@ void sportTelemetryLoop() {
 
     // WiFi AP doesn't need polling — it's always available
 
-    // Update packets-per-second counter
-    uint32_t nowSec = millis() / 1000;
-    if (nowSec != s_lastPpsSec) {
-        s_ppsValue  = s_ppsCount;
-        s_ppsCount  = 0;
-        s_lastPpsSec = nowSec;
-    }
 }
 
 void sportTelemetryStop() {
@@ -501,6 +500,42 @@ void sportTelemetryStop() {
     stopWiFiAP();
     s_running = false;
     LOG_I("SPORT", "Telemetry stopped");
+}
+
+// ─── Shared output layer ───────────────────────────────────────────
+
+void sportOutputInit() {
+    s_packetCount = 0;
+    s_ppsCount    = 0;
+    s_ppsValue    = 0;
+    s_lastPpsSec  = millis() / 1000;
+
+    if (g_config.telemetryOutput == TelemetryOutput::WIFI_UDP) {
+        if (bleIsInitialized()) {
+            // Single radio: BLE is already running; WiFi AP cannot start.
+            // Log a warning — packets will be silently discarded until
+            // the user changes telemetryOutput to BLE.
+            LOG_W("SPORT", "Output init: WiFi UDP requested but BLE is active "
+                           "(single radio). Telemetry output disabled. "
+                           "Set telemetryOutput=BLE to use BLE forwarding.");
+            return;
+        }
+        startWiFiAP();
+    }
+    // BLE output: BLE init is handled by main.cpp (bleInit)
+
+    const char* outputMode = (g_config.telemetryOutput == TelemetryOutput::WIFI_UDP)
+                             ? "WiFi-UDP" : "BLE";
+    LOG_I("SPORT", "Output init (Lua proxy): output=%s", outputMode);
+}
+
+void sportOutputForwardPacket(const SportPacket* pkt) {
+    forwardPacket(pkt);
+}
+
+void sportOutputStop() {
+    stopWiFiAP();
+    LOG_I("SPORT", "Output stopped (Lua proxy)");
 }
 
 bool sportUdpIsActive() {

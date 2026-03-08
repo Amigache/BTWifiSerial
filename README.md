@@ -107,6 +107,16 @@ Receives raw S.PORT data from EdgeTX's AUX2 Telemetry Mirror output.
 - **Baud rate:** 57600 (default) or 115200 (for TX16S / Horus F16). Configurable in the WebUI.
 - **Input protocol:** Native S.PORT bus: `[0x7E] [physID] [primID] [dataID] [value] [additive CRC]`. Only `DATA_FRAME` (primID = 0x10) packets are forwarded.
 
+### LUA Serial
+
+Bidirectional binary protocol between the ESP32 and two EdgeTX Lua scripts. Provides 8-channel trainer data (via Global Variables) and a rich on-radio configuration UI.
+
+- **Use case:** Full integration with EdgeTX — channel data, BLE management, telemetry forwarding, and settings are all handled from Lua scripts running on the radio.
+- **Protocol:** Custom binary frames over UART at 115200 8N1. See [lua-serial-protocol.md](docs/lua-serial-protocol.md) for full specification.
+- **Scripts:**
+  - `btwfs.lua` — Background **Function** script. Receives channel frames and writes values to GV1–GV8 (Flight Mode 0). Optionally forwards S.PORT telemetry from the radio to the ESP32 via `T_TLM` frames.
+  - `BTWifiSerial.lua` — **Tools** script. Provides a multi-page touch/button UI for managing AP mode, BLE role, BLE scanning/connecting, telemetry output selection, and viewing system information.
+
 ### Telemetry Output
 
 When using either S.PORT mode, parsed telemetry packets can be forwarded to:
@@ -115,6 +125,11 @@ When using either S.PORT mode, parsed telemetry packets can be forwarded to:
 |--------|-------------|
 | **WiFi UDP** | The ESP32 starts its own WiFi AP (`BTWifiSerial` / `12345678`). Connect your phone or tablet to it and receive 8-byte `SportPacket` datagrams broadcast on UDP port 5010 (configurable). |
 | **BLE** | Packets are re-framed with 0x7E framing and sent as BLE notifications on the FrSky characteristic (UUID `0xFFF6`). A BLE client app must be connected. |
+| **Off** | Telemetry packets are discarded. No extra output is started. This is the default. |
+
+> **Mutual exclusion — BLE telem and AP Mode:** The ESP32-C3 has a single shared radio. If WiFi AP mode is enabled while telemetry output is set to BLE, the firmware automatically resets telemetry output to Off before switching modes. This is enforced at the firmware level regardless of how the mode change is triggered.
+
+> **Telemetry AP:** When WiFi UDP is selected as the telemetry output in LUA Serial mode, the ESP32 boots into a special "Telemetry AP" mode. The WiFi AP is started for UDP broadcast, but the Lua scripts continue to operate normally — no orange overlay is shown, and the user can still interact with the Tools script UI. The LED blinks at 500 ms to indicate the WiFi AP is active.
 
 ## BLE Roles
 
@@ -176,7 +191,7 @@ Restarts the device in Normal mode. A confirmation dialog is shown before procee
 |-----------|---------|
 | OFF | Normal mode, no BLE connection |
 | Solid ON | Normal mode, BLE connected |
-| Blinking (500ms) | AP mode (WebUI active) |
+| Blinking (500ms) | AP mode or Telemetry AP mode (WiFi active) |
 | 3 rapid blinks | Mode toggle confirmed (before restart) |
 
 ## Button
@@ -239,6 +254,56 @@ For radios with internal Bluetooth (TX16S, Boxer, etc.):
 1. `SYS` → `Hardware` → set AUX port to **Telemetry Mirror**.
 2. In the WebUI, set Serial Mode to **S.PORT Telemetry (Mirror)** and match the baud rate (57600 for most radios, 115200 for TX16S/Horus).
 3. Select telemetry output destination (WiFi UDP or BLE).
+
+---
+
+### LUA Serial (via AUX port)
+
+1. `SYS` → `Hardware` → find your AUX port (AUX1 or AUX2) → set it to **LUA** at **115200** baud.
+2. Copy the Lua scripts to the radio's SD card:
+   - `btwfs.lua` → `/SCRIPTS/FUNCTIONS/btwfs.lua`
+   - `BTWifiSerial.lua` → `/SCRIPTS/TOOLS/BTWifiSerial.lua`
+3. In `MDL` → `Special Functions`, create a new entry:
+   - **Switch:** `ON` (always active)
+   - **Function:** `Lua Script`
+   - **Script:** `btwfs`
+4. Open the **BTWifiSerial** Tools script from the radio's Tools menu to access the configuration UI.
+5. Channel data is written to GV1–GV8 in Flight Mode 0. Use `GV1`–`GV8` as mixer inputs to feed the trainer channels into your model.
+
+> **Telemetry forwarding:** If the radio has active telemetry sensors, `btwfs.lua` automatically forwards S.PORT packets to the ESP32 via `T_TLM` frames. Configure the telemetry output (WiFi UDP, BLE, or Off) from the Telemetry page in the BTWifiSerial Tools script.
+
+---
+
+## Lua Scripts
+
+Two Lua scripts work together to provide full on-radio integration in LUA Serial mode.
+
+### btwfs.lua — Background Function Script
+
+**Location:** `/SCRIPTS/FUNCTIONS/btwfs.lua`
+
+Runs continuously as an EdgeTX Special Function (`Lua Script`, switch `ON`). Responsibilities:
+
+- **Channel data:** Parses `T_CH` frames from the ESP32 and writes 8 signed channel values (−1024 to +1024) into Global Variables GV1–GV8 (Flight Mode 0).
+- **Telemetry forwarding:** Calls `sportTelemetryPop()` each frame to collect pending S.PORT packets and sends them to the ESP32 as `T_TLM` frames (up to 8 packets per frame).
+- **Coexistence:** When the BTWifiSerial Tools script is active, incoming serial bytes are yielded to it via a shared-memory heartbeat mechanism. Telemetry forwarding continues independently.
+
+> **Resource efficiency:** `btwfs.lua` consumes only `T_CH` frames (channel data). All other frame types (`T_CFG`, `T_INF`, `T_SYS`) are discarded by the parser. The firmware detects when the Tools script is closed and suppresses the heavy periodic resync burst (`T_CFG + T_INF + T_SYS` every 30 s), sending only `T_CH` and `T_ST` while the background script runs alone.
+
+### BTWifiSerial.lua — Tools Script
+
+**Location:** `/SCRIPTS/TOOLS/BTWifiSerial.lua`
+
+Opened from the radio's `SYS` → `Tools` menu. Provides a full-screen multi-page UI:
+
+| Page | Description |
+|------|-------------|
+| **Dashboard** | Shows BLE connection status, system information (build version, serial mode, BT name, addresses), AP mode toggle. |
+| **Bluetooth** | BLE role selection (Peripheral/Central/Telemetry), scan for devices (Central mode), connect/disconnect/forget saved peers. |
+| **Telemetry** | Select telemetry output (WiFi UDP, BLE, or Off). Saving triggers a config write + ESP32 restart. |
+| **Settings** | Configure WiFi AP SSID, AP password, UDP port, and S.PORT Mirror baud rate. Changes that require a network restart trigger an automatic reboot. |
+
+The Tools script communicates with the ESP32 via command frames (`T_CMD`) and receives configuration/status via `T_CFG`, `T_INF`, `T_SYS`, and `T_ACK` frames.
 
 ---
 

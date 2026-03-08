@@ -35,7 +35,7 @@ void bleUpdateAdvertisingName(); // Peripheral only: restart adv with new name, 
 void bleLoop();           // Non-blocking, call from main loop
 
 // Central mode
-void bleScanStart();
+bool bleScanStart();
 void bleScanStop();
 bool bleIsScanning();
 uint8_t bleGetScanResults(BleScanResult* results, uint8_t maxCount);
@@ -45,7 +45,9 @@ void bleKickClient();   // Peripheral: disconnect the currently connected centra
 void bleForget();       // Central: disconnect + clear saved address (no auto-reconnect)
 
 // Status
+bool bleIsInitialized();  // true after bleInit(), false after bleStop()
 bool bleIsConnected();
+bool bleIsConnecting();   // true while a connection attempt is in progress
 const char* bleGetLocalAddress();
 const char* bleGetRemoteAddress();
 int  bleGetRSSI();

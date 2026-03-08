@@ -120,9 +120,9 @@ static void processAtCommand(const char* cmd) {
         if (!localAddr || !localAddr[0]) localAddr = "00:00:00:00:00:00";
 
         if (roleChar == '1') {
-            // Central (master)
-            if (g_config.bleRole != BleRole::CENTRAL) {
-                g_config.bleRole = BleRole::CENTRAL;
+            // Central (master) → Trainer IN
+            if (g_config.deviceMode != DeviceMode::TRAINER_IN) {
+                g_config.deviceMode = DeviceMode::TRAINER_IN;
                 configSave();
                 // Note: full role switch requires restart on ESP32-C3 due to
                 // NimBLE deinit limitations. For now, save config and respond.
@@ -132,9 +132,9 @@ static void processAtCommand(const char* cmd) {
             snprintf(addr, sizeof(addr), "Central:%s", localAddr);
             atReply(addr);
         } else {
-            // Peripheral (slave)
-            if (g_config.bleRole != BleRole::PERIPHERAL) {
-                g_config.bleRole = BleRole::PERIPHERAL;
+            // Peripheral (slave) → Trainer OUT
+            if (g_config.deviceMode != DeviceMode::TRAINER_OUT) {
+                g_config.deviceMode = DeviceMode::TRAINER_OUT;
                 configSave();
             }
             atReply("OK+Role:0");
@@ -148,7 +148,7 @@ static void processAtCommand(const char* cmd) {
     else if (strcmp(cmd, "+DISC?") == 0) {
         atReply("OK+DISCS");
         // Only scan in central mode
-        if (g_config.bleRole == BleRole::CENTRAL) {
+        if (bleIsCentral(g_config.deviceMode)) {
             bleScanStart();
             s_atScanPending   = true;
             s_atScanComplete  = false;
@@ -455,8 +455,8 @@ void frskySerialLoop() {
     // AT async events (scan results, connect/disconnect notifications)
     atPollEvents();
 
-    // TX: Send channel data to radio (Central mode / data from BLE)
-    if (g_config.bleRole == BleRole::CENTRAL || g_config.bleRole == BleRole::TELEMETRY) {
+    // TX: Send channel data to radio (Central/Telemetry mode — data from BLE)
+    if (g_config.deviceMode == DeviceMode::TRAINER_IN || g_config.deviceMode == DeviceMode::TELEMETRY) {
         uint32_t now = millis();
         if (now - s_lastFrameMs >= FRAME_INTERVAL_MS) {
             s_lastFrameMs = now;

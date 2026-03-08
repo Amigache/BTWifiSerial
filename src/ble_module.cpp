@@ -383,23 +383,21 @@ void bleInit() {
         configSave();
     }
 
-    switch (g_config.bleRole) {
-        case BleRole::PERIPHERAL:
-            initPeripheral();
-            break;
-        case BleRole::CENTRAL:
-            initCentral();
-            if (g_config.hasRemoteAddr && strlen(g_config.remoteBtAddr) > 0) {
-                LOG_I("BLE", "Auto-connecting to saved address: %s",
-                      g_config.remoteBtAddr);
-            }
-            break;
-        case BleRole::TELEMETRY:
-            initPeripheral();
-            break;
+    if (bleIsCentral(g_config.deviceMode)) {
+        initCentral();
+        if (g_config.hasRemoteAddr && strlen(g_config.remoteBtAddr) > 0) {
+            LOG_I("BLE", "Auto-connecting to saved address: %s",
+                  g_config.remoteBtAddr);
+        }
+    } else {
+        initPeripheral();
     }
 
     s_initialized = true;
+}
+
+bool bleIsInitialized() {
+    return s_initialized;
 }
 
 void bleStop() {
@@ -439,7 +437,7 @@ void bleScheduleReinit() {
 
 void bleUpdateAdvertisingName() {
     if (!s_initialized) return;
-    if (g_config.bleRole != BleRole::PERIPHERAL) return;
+    if (bleIsCentral(g_config.deviceMode)) return;  // only peripherals advertise
     if (webUiIsActive()) return;
     NimBLEAdvertising* pAdv = NimBLEDevice::getAdvertising();
     pAdv->stop();
@@ -498,7 +496,7 @@ void bleLoop() {
     // Suppressed while the WebUI/AP is active: BLE connect attempts every 5s
     // monopolise the 2.4 GHz radio and cause the WiFi AP to disappear.
     // The user can connect manually from the WebUI instead.
-    if (g_config.bleRole == BleRole::CENTRAL && !s_connected && !s_scanning &&
+    if (bleIsCentral(g_config.deviceMode) && !s_connected && !s_scanning &&
         !s_connectInProgress && s_autoReconnect && !s_pendingReinit &&
         !webUiIsActive()) {
         static uint32_t lastReconnectAttempt = 0;
@@ -512,7 +510,7 @@ void bleLoop() {
     }
 
     // In Peripheral mode: send channel data as notifications if connected
-    if (g_config.bleRole == BleRole::PERIPHERAL && s_connected && s_pCharTx) {
+    if (!bleIsCentral(g_config.deviceMode) && s_connected && s_pCharTx) {
         if (g_channelData.newData) {
             uint16_t channels[BT_CHANNELS];
             g_channelData.getChannels(channels, BT_CHANNELS);
@@ -532,15 +530,15 @@ void bleSendRawNotification(const uint8_t* data, size_t len) {
     s_pCharTx->notify();
 }
 
-void bleScanStart() {
-    if (s_scanning) return;
+bool bleScanStart() {
+    if (s_scanning) return false;
 
     // Lazy-init BLE controller if not already running (AP mode)
     ensureController();
 
-    if (g_config.bleRole != BleRole::CENTRAL) {
+    if (!bleIsCentral(g_config.deviceMode)) {
         LOG_I("BLE", "Scan only available in Central mode");
-        return;
+        return false;
     }
 
     s_scanCount = 0;
@@ -555,6 +553,7 @@ void bleScanStart() {
     pScan->start(5, onScanComplete);   // 5 seconds, non-blocking with callback
 
     LOG_I("BLE", "Scan started (5s)");
+    return true;
 }
 
 void bleScanStop() {
@@ -715,7 +714,7 @@ void bleForget() {
 }
 
 void bleKickClient() {
-    if (g_config.bleRole == BleRole::PERIPHERAL && s_connected && s_pServer &&
+    if (!bleIsCentral(g_config.deviceMode) && s_connected && s_pServer &&
         s_connHandle != BLE_HS_CONN_HANDLE_NONE) {
         s_pServer->disconnect(s_connHandle);
         LOG_I("BLE", "Peripheral: kicked connected client");
@@ -724,6 +723,10 @@ void bleKickClient() {
 
 bool bleIsConnected() {
     return s_connected;
+}
+
+bool bleIsConnecting() {
+    return s_connectInProgress;
 }
 
 const char* bleGetLocalAddress() {

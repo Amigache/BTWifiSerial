@@ -27,13 +27,21 @@ struct SportPacket {
 
 static constexpr uint8_t SPORT_DATA_FRAME = 0x10;
 
-// ─── Public API ─────────────────────────────────────────────────────
+// ─── Native UART telemetry (SPORT_BT / SPORT_MIRROR input modes) ──────
 void sportTelemetryInit();
 void sportTelemetryLoop();
 void sportTelemetryStop();
 
+// ─── Shared output layer (also used by Lua T_TLM proxy) ──────────────
+// Call sportOutputInit() when starting Lua-proxied telemetry forwarding.
+// sportOutputForwardPacket() routes the packet to UDP or BLE per config.
+// sportOutputStop() tears down WiFi AP (BLE is managed by main).
+void sportOutputInit();
+void sportOutputForwardPacket(const SportPacket* pkt);
+void sportOutputStop();
+
 // ─── Output control ─────────────────────────────────────────────────
-bool sportUdpIsActive();          // Is WiFi STA + UDP running?
+bool sportUdpIsActive();          // Is WiFi AP + UDP running?
 bool sportBleIsForwarding();      // Is BLE telemetry forwarding active?
 
 // ─── Stats ──────────────────────────────────────────────────────────

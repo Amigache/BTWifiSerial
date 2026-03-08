@@ -3,7 +3,7 @@
  * @brief Persistent configuration management for BTWifiSerial
  *
  * Uses ESP32 Preferences (NVS) to store and retrieve settings.
- * All configurable parameters: serial output mode, BT name, BT role,
+ * All configurable parameters: serial output mode, device mode, BT name,
  * saved remote BT address.
  */
 
@@ -22,26 +22,30 @@ enum class OutputMode : uint8_t {
     FRSKY        = 0,  // FrSky CC2540 trainer protocol (115200 8N1)
     SBUS         = 1,  // SBUS trainer (100000 8E2 inverted)
     SPORT_BT     = 2,  // S.PORT telemetry via BT framing (115200 8N1, XOR CRC)
-    SPORT_MIRROR = 3   // S.PORT telemetry mirror from AUX2 (57600/115200, raw)
+    SPORT_MIRROR = 3,  // S.PORT telemetry mirror from AUX2 (57600/115200, raw)
+    LUA_SERIAL   = 4   // EdgeTX LUA serial: bidirectional channel + command protocol
 };
 
 // ─── Telemetry output destination ───────────────────────────────────
 enum class TelemetryOutput : uint8_t {
     WIFI_UDP = 0,  // Broadcast via WiFi UDP
-    BLE      = 1   // Forward via BLE notifications
+    BLE      = 1,  // Forward via BLE notifications
+    NONE     = 2   // No telemetry output (discard packets)
 };
 
-// ─── BLE role ───────────────────────────────────────────────────────
-enum class BleRole : uint8_t {
-    PERIPHERAL = 0,   // Peripheral (slave) - radio connects to us
-    CENTRAL    = 1,   // Central (master) - we connect to a device (e.g. HeadTracker)
-    TELEMETRY  = 2    // Telemetry relay mode
+// ─── Device mode ────────────────────────────────────────────────────
+enum class DeviceMode : uint8_t {
+    TRAINER_IN  = 0,  // BLE Central: receive channels from a remote device
+    TRAINER_OUT = 1,  // BLE Peripheral: send radio channels to a remote device
+    TELEMETRY   = 2   // Telemetry relay: forward S.PORT via WiFi UDP or BLE
 };
+
+inline bool bleIsCentral(DeviceMode m) { return m == DeviceMode::TRAINER_IN; }
 
 // ─── Configuration structure ────────────────────────────────────────
 struct Config {
     OutputMode      serialMode;
-    BleRole         bleRole;
+    DeviceMode      deviceMode;
     char            btName[32];
     char            localBtAddr[18];     // "XX:XX:XX:XX:XX:XX\0" (cached)
     char            remoteBtAddr[18];    // "XX:XX:XX:XX:XX:XX\0"
@@ -53,17 +57,23 @@ struct Config {
     uint16_t        udpPort;             // UDP broadcast port (default 5010)
     uint32_t        sportBaud;           // Baud for SPORT_MIRROR (57600 or 115200)
 
+    // WiFi AP settings
+    char            apSsid[16];          // AP SSID (max 15 chars + null)
+    char            apPass[16];          // AP password (max 15 chars + null)
+
     void setDefaults() {
         serialMode      = OutputMode::FRSKY;
-        bleRole         = BleRole::PERIPHERAL;
+        deviceMode      = DeviceMode::TRAINER_IN;
         strlcpy(btName, "BTWifiSerial", sizeof(btName));
         memset(localBtAddr, 0, sizeof(localBtAddr));
         memset(remoteBtAddr, 0, sizeof(remoteBtAddr));
         hasRemoteAddr   = false;
         remoteAddrType  = 0;
-        telemetryOutput = TelemetryOutput::WIFI_UDP;
+        telemetryOutput = TelemetryOutput::NONE;
         udpPort         = 5010;
         sportBaud       = 57600;
+        strlcpy(apSsid, "BTWifiSerial", sizeof(apSsid));
+        strlcpy(apPass, "12345678", sizeof(apPass));
     }
 };
 
@@ -71,5 +81,9 @@ struct Config {
 void   configInit();
 void   configSave();
 void   configLoad();
+
+// ─── Build timestamp ────────────────────────────────────────────────
+// Format: DDMMYYYYHHMM  e.g. "070320261021" for 07/03/2026 at 10:21
+extern const char* BUILD_TIMESTAMP;
 
 extern Config g_config;

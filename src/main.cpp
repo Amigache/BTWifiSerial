@@ -25,6 +25,7 @@
 #include "frsky_serial.h"
 #include "sbus_output.h"
 #include "sport_telemetry.h"
+#include "lua_serial.h"
 #include "web_ui.h"
 
 // â”€â”€â”€ Runtime log level (defined here, declared extern in log.h) â”€â”€â”€â”€â”€
@@ -36,6 +37,7 @@ ChannelData g_channelData;
 // ─── Boot mode via NVS (RTC_DATA_ATTR does NOT survive ESP.restart on ESP32-C3) ─
 static constexpr uint8_t BOOT_NORMAL  = 0;
 static constexpr uint8_t BOOT_AP_MODE = 1;
+static constexpr uint8_t BOOT_TELEM_AP = 2;  // WiFi AP + web UI + LuaSerial (no BLE, Lua not blocked)
 
 static uint8_t readBootMode() {
     Preferences p;
@@ -53,7 +55,7 @@ static void writeBootMode(uint8_t mode) {
 }
 
 // â”€â”€â”€ Application state â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-enum class AppMode : uint8_t { NORMAL, AP_MODE };
+enum class AppMode : uint8_t { NORMAL, AP_MODE, TELEM_AP };
 static AppMode s_appMode      = AppMode::NORMAL;
 static bool    s_serialActive = false;
 
@@ -74,12 +76,16 @@ static bool     s_ledState      = false;
 // â”€â”€â”€ Forward declarations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 static void startNormalMode();
 static void startApMode();
+static void startTelemetryApMode();
 static void stopSerialOutput();
 static void startSerialOutput();
 static void handleButton();
 static void updateLed();
 static void blinkLed(uint8_t times, uint32_t onMs, uint32_t offMs);
 static void switchModeTo(AppMode next);
+void mainSetTelemOutput(uint8_t output);   // save config + restart into telemetry AP or normal
+void mainSetDeviceMode(uint8_t mode);      // save device mode + restart
+void mainSetMirrorBaud(uint32_t baud);     // save mirror baud + restart
 
 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 // SETUP
@@ -123,6 +129,9 @@ void setup() {
     if (bootMode == BOOT_AP_MODE) {
         LOG_I("MAIN", "NVS: booting into AP mode");
         startApMode();
+    } else if (bootMode == BOOT_TELEM_AP) {
+        LOG_I("MAIN", "NVS: booting into Telemetry AP mode");
+        startTelemetryApMode();
     } else {
         LOG_I("MAIN", "NVS: booting into NORMAL mode");
         startNormalMode();
@@ -144,18 +153,28 @@ void loop() {
             bleLoop();
             if (s_serialActive) {
                 switch (g_config.serialMode) {
-                    case OutputMode::FRSKY:        frskySerialLoop(); break;
-                    case OutputMode::SBUS:         sbusLoop();        break;
+                    case OutputMode::FRSKY:        frskySerialLoop();    break;
+                    case OutputMode::SBUS:         sbusLoop();           break;
                     case OutputMode::SPORT_BT:
-                    case OutputMode::SPORT_MIRROR:  sportTelemetryLoop(); break;
+                    case OutputMode::SPORT_MIRROR: sportTelemetryLoop(); break;
+                    case OutputMode::LUA_SERIAL:   luaSerialLoop();      break;
                 }
             }
             break;
 
         case AppMode::AP_MODE:
-            // Only the web UI runs in AP mode.  BLE advertising is off
-            // (no bleLoop needed) and serial output is not started.
+            // Web UI always runs in AP mode.
             webUiLoop();
+            // If LUA serial is active (serial mode = LUA_SERIAL), keep running
+            // so the Lua script can detect AP mode and show the overlay modal.
+            if (s_serialActive) luaSerialLoop();
+            break;
+
+        case AppMode::TELEM_AP:
+            // Telemetry AP: WiFi AP + web UI available + LuaSerial active.
+            // BLE is NOT running; Lua is not blocked (apMode=2 in T_CFG).
+            webUiLoop();
+            if (s_serialActive) luaSerialLoop();
             break;
     }
 
@@ -171,7 +190,30 @@ static void startNormalMode() {
     LOG_I("MAIN", ">>> NORMAL MODE <<<");
     LOG_D("MAIN", "Free heap: %u", ESP.getFreeHeap());
 
-    bleInit();
+    // LUA_SERIAL + WiFi UDP output → must run Telemetry AP mode
+    // (WiFi AP + web UI + LuaSerial, no BLE).  Redirect here so the Lua script
+    // always sees a consistent state regardless of whether BOOT_TELEM_AP was
+    // written (e.g. after a web-UI Reboot, power cycle, or first-time flash).
+    // Device mode is irrelevant: in LUA_SERIAL mode the channel data comes via
+    // UART AUX, not BLE, so the BLE stack is not needed.
+    if (g_config.serialMode == OutputMode::LUA_SERIAL &&
+        g_config.telemetryOutput == TelemetryOutput::WIFI_UDP) {
+        LOG_I("MAIN", "LUA Serial + WiFi UDP: redirecting to Telemetry AP mode");
+        startTelemetryApMode();
+        return;
+    }
+
+    // The ESP32-C3 has a single shared radio: BLE and WiFi AP cannot run
+    // simultaneously. Skip BLE init when the telemetry mode uses WiFi UDP
+    // output — sportTelemetryInit() will start the AP instead.
+    bool wifiTelemetry =
+        (g_config.serialMode == OutputMode::SPORT_BT ||
+         g_config.serialMode == OutputMode::SPORT_MIRROR) &&
+        g_config.telemetryOutput == TelemetryOutput::WIFI_UDP;
+
+    if (!wifiTelemetry) {
+        bleInit();
+    }
     startSerialOutput();
 
     s_appMode = AppMode::NORMAL;
@@ -191,8 +233,36 @@ static void startApMode() {
 
     webUiInit();
 
+    // If the serial mode is LUA_SERIAL, keep the UART running so the
+    // Lua script can detect AP mode and display the modal overlay.
+    if (g_config.serialMode == OutputMode::LUA_SERIAL) {
+        luaSerialInit();
+        luaSerialSetApMode(1);  // 1 = AP-block mode: Lua shows orange overlay
+        s_serialActive = true;
+    }
+
     s_appMode = AppMode::AP_MODE;
     LOG_D("MAIN", "AP mode running, heap: %u", ESP.getFreeHeap());
+}
+
+static void startTelemetryApMode() {
+    LOG_I("MAIN", ">>> TELEMETRY AP MODE <<<  SSID=BTWifiSerial  pass=12345678");
+    LOG_I("MAIN", "Browse to http://192.168.4.1  or  http://btwifiserial.local");
+    LOG_D("MAIN", "Free heap: %u", ESP.getFreeHeap());
+
+    // WiFi AP starts via webUiInit(); no BLE (single-radio constraint).
+    // LuaSerial runs so the Lua script can continue normally while the
+    // UDP telemetry is forwarded over the WiFi AP.
+    webUiInit();
+
+    if (g_config.serialMode == OutputMode::LUA_SERIAL) {
+        luaSerialInit();
+        luaSerialSetApMode(2);  // 2 = telemetry AP: Lua keeps running, no overlay
+        s_serialActive = true;
+    }
+
+    s_appMode = AppMode::TELEM_AP;
+    LOG_D("MAIN", "Telemetry AP mode running, heap: %u", ESP.getFreeHeap());
 }
 
 static void startSerialOutput() {
@@ -202,6 +272,7 @@ static void startSerialOutput() {
         case OutputMode::SBUS:         sbusInit();             break;
         case OutputMode::SPORT_BT:
         case OutputMode::SPORT_MIRROR: sportTelemetryInit();   break;
+        case OutputMode::LUA_SERIAL:   luaSerialInit();        break;
     }
     s_serialActive = true;
 }
@@ -211,6 +282,7 @@ static void stopSerialOutput() {
     frskySerialStop();
     sbusStop();
     sportTelemetryStop();
+    luaSerialStop();
     s_serialActive = false;
 }
 
@@ -241,6 +313,63 @@ static void switchModeTo(AppMode next) {
     }
 
     blinkLed(3, 80, 80);   // 3 fast blinks -> visual confirmation
+    delay(100);
+    ESP.restart();
+}
+void mainSetTelemOutput(uint8_t output) {
+    g_config.telemetryOutput = static_cast<TelemetryOutput>(output);
+    configSave();
+    // WiFi UDP output requires the Telemetry AP boot mode;
+    // BLE output restores the normal boot mode.
+    if (output == static_cast<uint8_t>(TelemetryOutput::WIFI_UDP)) {
+        writeBootMode(BOOT_TELEM_AP);
+    }
+    // No explicit writeBootMode for BLE: setup() always resets to BOOT_NORMAL
+    // on boot, so if BOOT_TELEM_AP was previously set it will be cleared.
+    blinkLed(3, 80, 80);
+    delay(100);
+    ESP.restart();
+}
+/**
+ * @brief Called by lua_serial.cpp when it receives a "toggle AP" command.
+ *        Switches to AP mode via the normal NVS flag + restart path.
+ */
+void mainRequestApMode() {
+    switchModeTo(AppMode::AP_MODE);
+}
+
+/**
+ * @brief Called by lua_serial.cpp — switch to normal mode + restart.
+ */
+void mainRequestNormalMode() {
+    switchModeTo(AppMode::NORMAL);
+}
+
+/**
+ * @brief Called by lua_serial.cpp — set device mode, save config, restart.
+ */
+void mainSetDeviceMode(uint8_t mode) {
+    g_config.deviceMode = static_cast<DeviceMode>(mode);
+    configSave();
+
+    // If Telemetry + WiFi UDP, need Telemetry AP boot mode
+    if (g_config.deviceMode == DeviceMode::TELEMETRY &&
+        g_config.telemetryOutput == TelemetryOutput::WIFI_UDP) {
+        writeBootMode(BOOT_TELEM_AP);
+    }
+
+    blinkLed(3, 80, 80);
+    delay(100);
+    ESP.restart();
+}
+
+/**
+ * @brief Called by lua_serial.cpp — set mirror baud rate, save config, restart.
+ */
+void mainSetMirrorBaud(uint32_t baud) {
+    g_config.sportBaud = baud;
+    configSave();
+    blinkLed(3, 80, 80);
     delay(100);
     ESP.restart();
 }
@@ -288,7 +417,7 @@ static void updateLed() {
     uint32_t now = millis();
 
     // AP mode: blink at 500 ms regardless of BLE state
-    if (s_appMode == AppMode::AP_MODE) {
+    if (s_appMode == AppMode::AP_MODE || s_appMode == AppMode::TELEM_AP) {
         if (now - s_lastLedToggle >= 500) {
             s_lastLedToggle = now;
             s_ledState = !s_ledState;
