@@ -43,7 +43,7 @@ enum class DeviceMode : uint8_t {
 // ─── Trainer channel mapping mode ───────────────────────────────────
 enum class TrainerMapMode : uint8_t {
     MAP_GV = 0,  // Inject BLE channels into Global Variables (GV1–GV8)
-    MAP_TR = 1   // Inject BLE channels into Trainer inputs via setTrainerChannel()
+    MAP_TR = 1   // Inject BLE channels into Trainer inputs via setTrainerChannels()
 };
 
 inline bool bleIsCentral(DeviceMode m) { return m == DeviceMode::TRAINER_IN; }

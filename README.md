@@ -1,6 +1,12 @@
 # BTWifiSerial
 
-ESP32-C3 firmware that acts as a BLE-to-Serial bridge for EdgeTX/OpenTX RC radios. It replaces the legacy FrSky CC2540/HM-10 Bluetooth module with a modern, configurable alternative that supports trainer links, SBUS output, and S.PORT telemetry forwarding — all configurable via a built-in web interface.
+![Build](https://img.shields.io/badge/build-passing-brightgreen)
+![PlatformIO](https://img.shields.io/badge/PlatformIO-ESP32--C3-orange)
+![Framework](https://img.shields.io/badge/framework-Arduino-blue)
+![EdgeTX](https://img.shields.io/badge/EdgeTX-Lua%20Tools-6f42c1)
+![Protocol](https://img.shields.io/badge/protocol-BTWS-1f6feb)
+
+ESP32-C3 firmware that acts as a BLE-to-Serial bridge for EdgeTX/OpenTX RC radios. It replaces the legacy FrSky CC2540/HM-10 Bluetooth module with a modern, configurable alternative that supports trainer links, SBUS output, and S.PORT telemetry forwarding. Configuration is available via the built-in WebUI and, in Lua Serial mode, from the EdgeTX Tools script on the radio.
 
 ## Features
 
@@ -8,6 +14,7 @@ ESP32-C3 firmware that acts as a BLE-to-Serial bridge for EdgeTX/OpenTX RC radio
 - **SBUS Trainer** — outputs standard SBUS signal via UART (100000 8E2)
 - **S.PORT Telemetry** — receives and forwards telemetry data via WiFi UDP or BLE
 - **Web Configuration** — dark-themed responsive WebUI served from the ESP32's own WiFi AP
+- **On-Radio Lua Configuration** — in Lua Serial mode, settings can be changed directly from EdgeTX Tools script UI
 - **OTA Updates** — drag-and-drop firmware upload from the browser
 - **AT Command Emulation** — responds to HM-10/CC2540 AT commands so EdgeTX sees a native BT module
 
@@ -279,7 +286,7 @@ For radios with internal Bluetooth (TX16S, Boxer, etc.):
 4. Open the **BTWifiSerial** Tools script from the radio's Tools menu to access the configuration UI.
 5. Channel data injection depends on the **Trainer Map** setting (configurable from the BTWifiSerial Tools script or the Web UI):
    - **GV** (default) — values are written to GV1–GV8 in Flight Mode 0. Use `GV1`–`GV8` as mixer inputs.
-   - **TR** — values are injected via `setTrainerChannel()` (±1024 → ±512). Use `TR1`–`TR8` as mixer inputs, and set Trainer mode to **Master/Serial** in Model Settings.
+   - **TR** — values are injected via `setTrainerChannels()` (array of 8 channels, scaled ±1024 → ±512). Use `TR1`–`TR8` as mixer inputs, and set Trainer mode to **Master/Serial** in Model Settings.
 
 > **Telemetry forwarding:** If the radio has active telemetry sensors, `btwfs.lua` automatically forwards S.PORT packets to the ESP32 via `T_TLM` frames. Configure the telemetry output (WiFi UDP, BLE, or Off) from the Telemetry page in the BTWifiSerial Tools script.
 
@@ -297,7 +304,7 @@ Runs continuously as an EdgeTX Special Function (`Lua Script`, switch `ON`). Res
 
 - **Channel data:** Parses `T_CH` frames from the ESP32 and injects 8 signed channel values (−1024 to +1024) into the radio. The injection method depends on the **Trainer Map** setting:
   - **GV** (default) — writes values to Global Variables GV1–GV8 (Flight Mode 0). Use `GV1`–`GV8` as mixer inputs.
-  - **TR** — calls `setTrainerChannel()` with values divided by 2 (±1024 → ±512, matching EdgeTX's ±512 trainer range). Use `TR1`–`TR8` as mixer inputs.
+   - **TR** — calls `setTrainerChannels()` with an 8-channel array, each value divided by 2 (±1024 → ±512, matching EdgeTX's ±512 trainer range). Use `TR1`–`TR8` as mixer inputs.
 - **Config fallback:** When the BTWifiSerial Tools script is not running, `btwfs.lua` reads the Trainer Map setting directly from the `T_CFG` frame sent by the ESP32, ensuring correct injection mode without user intervention.
 - **Telemetry forwarding:** Calls `sportTelemetryPop()` each frame to collect pending S.PORT packets and sends them to the ESP32 as `T_TLM` frames (up to 8 packets per frame).
 - **Coexistence:** When the BTWifiSerial Tools script is active, incoming serial bytes are yielded to it via a shared-memory heartbeat mechanism. The Trainer Map mode is communicated via shared memory (SHM slot 2). Telemetry forwarding continues independently.
