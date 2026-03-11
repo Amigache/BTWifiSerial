@@ -1,7 +1,285 @@
-# BTWifiSerial — LUA Serial Communication Protocol
+# BTWifiSerial — LUA Serial Communication Protocol (v2)
 
-Reference documentation for the binary protocol between the ESP32-C3 firmware
-and the EdgeTX script `BTWifiSerial.lua`.
+Reference documentation for the binary multi-channel protocol between the
+ESP32-C3 firmware and the EdgeTX Lua scripts (`BTWFS/main.lua`, `btwfs.lua`).
+
+---
+
+## 1. Physical Layer
+
+| Parameter        | Value                |
+|------------------|----------------------|
+| Interface        | UART1                |
+| Baud rate        | 115 200              |
+| Format           | 8N1 (no parity)      |
+| Flow control     | None                 |
+| TX GPIO (ESP32)  | GPIO 21              |
+| RX GPIO (ESP32)  | GPIO 20              |
+| EdgeTX AUX mode  | **LUA** at 115200    |
+
+---
+
+## 2. Frame Structure
+
+All frames — in both directions — use the same envelope:
+
+```
+[SYNC : 0xAA] [CH : 1] [TYPE : 1] [LEN : 1] [PAYLOAD : LEN bytes] [CRC : 1]
+```
+
+| Field   | Bytes | Description                                                              |
+|---------|-------|--------------------------------------------------------------------------|
+| SYNC    | 1     | Always `0xAA`                                                            |
+| CH      | 1     | Logical channel (see §3)                                                 |
+| TYPE    | 1     | Frame type within the channel                                            |
+| LEN     | 1     | Payload length in bytes (0–255)                                          |
+| PAYLOAD | LEN   | Frame data                                                               |
+| CRC     | 1     | `XOR(CH, TYPE, LEN, payload[0..LEN-1])` — SYNC is **not** included      |
+
+The parser is fully generic: no frame sizes are hardcoded. A parser that does
+not recognise a (CH, TYPE) pair simply discards the frame after CRC validation.
+
+---
+
+## 3. Logical Channels
+
+| CH     | Name      | Purpose                                               |
+|--------|-----------|-------------------------------------------------------|
+| `0x01` | **PREF**  | Preferences / configuration — bidirectional           |
+| `0x02` | **INFO**  | Status, channel data, BLE scan — bidirectional        |
+| `0x03` | **TRANS** | Transparent byte passthrough — bidirectional          |
+
+---
+
+## 4. CH_PREF — Preferences Channel
+
+### 4.1 ESP32 → Lua
+
+#### `PT_PREF_BEGIN` `0x01`
+Signals the start of a full preference list transmission.
+
+| Offset | Bytes | Description              |
+|--------|-------|--------------------------|
+| 0      | 1     | Total number of prefs to follow |
+
+#### `PT_PREF_ITEM` `0x02`
+One full preference descriptor. Payload format:
+
+```
+id(1) type(1) flags(1) label_len(1) label(N) <type-specific>
+```
+
+**Type-specific data:**
+
+| Type       | Code | Additional bytes                                                                     |
+|------------|------|--------------------------------------------------------------------------------------|
+| `FT_ENUM`  | `0`  | `opt_count(1)  cur_idx(1)  [opt_len(1)  opt_str(N)] × opt_count`  (0-based index)  |
+| `FT_STRING`| `1`  | `max_len(1)  val_len(1)  val(N)`                                                     |
+| `FT_INT`   | `2`  | `min_lo(1) min_hi(1)  max_lo(1) max_hi(1)  val_lo(1) val_hi(1)`  (LE int16)        |
+| `FT_BOOL`  | `3`  | `val(1)` — `0`=false, `1`=true                                                       |
+
+**Flags byte (PF\_\*):**
+
+| Bit | Mask   | Name          | Description                        |
+|-----|--------|---------------|------------------------------------|
+| 0   | `0x01` | `PF_RESTART`  | Device restart needed to apply     |
+| 1   | `0x02` | `PF_RDONLY`   | Read-only — PREF_SET is ignored    |
+| 2   | `0x04` | `PF_DASHBOARD`| Show on Dashboard System section   |
+
+#### `PT_PREF_END` `0x03`
+Signals the end of the current preference list. No payload.
+
+#### `PT_PREF_UPDATE` `0x04`
+Value-only update for one preference (fired after a cascade or a
+non-restart-requiring save). Payload:
+
+```
+id(1) type(1) <value — same encoding as the type-specific value in PREF_ITEM>
+```
+
+For `FT_ENUM`/`FT_BOOL` the value is the new index/bool byte.
+
+#### `PT_PREF_ACK` `0x05`
+Result of the last `PREF_SET`. Flushed to UART before any device restart.
+
+| Offset | Description                 |
+|--------|-----------------------------|
+| 0      | Preference ID               |
+| 1      | `0x00` = success, `0x01` = error |
+
+### 4.2 Lua → ESP32
+
+#### `PT_PREF_REQUEST` `0x10`
+Request a full `PREF_BEGIN + PREF_ITEM × N + PREF_END` sequence. No payload.
+
+#### `PT_PREF_SET` `0x11`
+Set a preference value. Payload:
+
+```
+id(1) type(1) <value — same encoding as PREF_ITEM type-specific value>
+```
+
+### 4.3 Preference IDs
+
+| ID     | Name            | Type       | Flags                          | Options / Constraints                       |
+|--------|-----------------|------------|--------------------------------|---------------------------------------------|
+| `0x01` | `AP_MODE`       | `FT_ENUM`  | `PF_RESTART \| PF_DASHBOARD`   | `"Normal"` / `"WiFi AP"` / `"Telem AP"`    |
+| `0x02` | `DEV_MODE`      | `FT_ENUM`  | `PF_RESTART \| PF_DASHBOARD`   | `"Trainer IN"` / `"Trainer OUT"` / `"Telemetry"` |
+| `0x03` | `TELEM_OUT`     | `FT_ENUM`  | `PF_RESTART \| PF_DASHBOARD`   | `"WiFi UDP"` / `"BLE"` / `"Off"`           |
+| `0x04` | `MIRROR_BAUD`   | `FT_ENUM`  | `PF_RESTART`                   | `"57600"` / `"115200"`                     |
+| `0x05` | `MAP_MODE`      | `FT_ENUM`  | —                              | `"GV"` (Global Variables) / `"TR"` (Trainer)|
+| `0x06` | `BT_NAME`       | `FT_STRING`| `PF_DASHBOARD`                 | maxLen = 15                                 |
+| `0x07` | `AP_SSID`       | `FT_STRING`| `PF_RESTART`                   | maxLen = 15                                 |
+| `0x08` | `UDP_PORT`      | `FT_STRING`| `PF_RESTART`                   | maxLen = 5, range 1024–65535                |
+| `0x09` | `AP_PASS`       | `FT_STRING`| `PF_RESTART`                   | maxLen = 15, minLen = 8                     |
+
+### 4.4 Business-logic cascades
+
+When certain prefs change, the firmware may alter other prefs and sends
+`PREF_UPDATE` for each cascade **before** `PREF_ACK`:
+
+| Trigger                                  | Cascade                              |
+|------------------------------------------|--------------------------------------|
+| `DEV_MODE` → Trainer IN or Trainer OUT   | `TELEM_OUT` forced to `Off`          |
+| `AP_MODE` → WiFi AP                      | `TELEM_OUT` forced to `Off` if BLE   |
+| `AP_MODE` → Normal                       | `TELEM_OUT` cleared if WiFi UDP      |
+
+---
+
+## 5. CH_INFO — Information Channel
+
+### 5.1 ESP32 → Lua
+
+#### `PT_INFO_CHANNELS` `0x01`
+Sent at ~100 Hz while BLE is connected and channel data is fresh.
+
+Payload: 8 × int16 big-endian = **16 bytes**.  
+Range: −1024 (−100 %) … 0 (centre) … +1024 (+100 %).
+
+#### `PT_INFO_STATUS` `0x02`
+Sent every 500 ms.
+
+| Bit | Description                  |
+|-----|------------------------------|
+| 0   | `1` = BLE connected          |
+| 1   | `1` = WiFi AP has ≥1 client  |
+| 2   | `1` = BLE connecting         |
+
+#### `PT_INFO_BEGIN` `0x03`
+Start of info list. Payload: `count(1)`.
+
+#### `PT_INFO_ITEM` `0x04`
+One read-only info field. Payload:
+
+```
+id(1) type(1) label_len(1) label(N) value(var)
+```
+
+Value encoding is the same as `PREF_ITEM` for that type (no options/maxLen).
+
+#### `PT_INFO_END` `0x05`
+End of info list. No payload.
+
+#### `PT_INFO_UPDATE` `0x06`
+Value-only update for one info field. Payload: `id(1) type(1) value(var)`.
+
+#### `PT_INFO_SCAN_STATUS` `0x07`
+BLE scan state notification. Payload: `state(1) count(1)`.
+
+`state`: `0`=idle, `1`=scanning, `2`=complete (results are being sent).
+
+#### `PT_INFO_SCAN_ITEM` `0x08`
+One BLE scan result entry.
+
+```
+idx(1) rssi_s8(1) flags(1) name_len(1) name(N) addr(17 null-padded)
+```
+
+`flags` bit 0: device advertises FrSky service.
+
+### 5.2 Lua → ESP32
+
+| Type                         | Code   | Payload      | Description                     |
+|------------------------------|--------|--------------|---------------------------------|
+| `PT_INFO_REQUEST`            | `0x10` | none         | Request full info + pref lists  |
+| `PT_INFO_HEARTBEAT`          | `0x11` | none         | Tools script alive              |
+| `PT_INFO_BLE_SCAN`           | `0x12` | none         | Start BLE scan                  |
+| `PT_INFO_BLE_CONNECT`        | `0x13` | `idx(1)`     | Connect to scan result          |
+| `PT_INFO_BLE_DISCONNECT`     | `0x14` | none         | Disconnect BLE                  |
+| `PT_INFO_BLE_FORGET`         | `0x15` | none         | Forget saved BLE device         |
+| `PT_INFO_BLE_RECONNECT`      | `0x16` | none         | Reconnect to saved device       |
+
+### 5.3 Info IDs
+
+| ID     | Name         | Type       | Description                          |
+|--------|--------------|------------|--------------------------------------|
+| `0x01` | `FIRMWARE`   | `FT_STRING`| Build timestamp `"DDMMYYYY HHMM"`    |
+| `0x02` | `BT_ADDR`    | `FT_STRING`| Local BT MAC `"XX:XX:XX:XX:XX:XX"`  |
+| `0x03` | `REM_ADDR`   | `FT_STRING`| Saved remote BT MAC or `"(none)"`    |
+
+---
+
+## 6. CH_TRANS — Transparent Channel
+
+Raw bytes wrapped in the standard frame envelope. Both directions.
+
+| TYPE              | Code   | Payload description                                       |
+|-------------------|--------|-----------------------------------------------------------|
+| `PT_TRANS_SBUS`   | `0x01` | Raw SBUS frame bytes                                      |
+| `PT_TRANS_SPORT`  | `0x02` | S.PORT packet: `physId(1) primId(1) dataId(2 LE) value(4 LE)` |
+| `PT_TRANS_FRSKY`  | `0x03` | Raw FrSky CC2540 bytes                                    |
+
+The CRC in the outer frame protects the payload bytes.
+No inner CRC is added — the outer CRC is sufficient.
+
+---
+
+## 7. Initialisation Sequence
+
+On script start (or after a device restart), the Lua side sends:
+
+```
+PT_INFO_REQUEST  (CH_INFO 0x10)   — triggers prefs + info + status
+PT_PREF_REQUEST  (CH_PREF 0x10)   — (redundant but harmless, can be omitted)
+```
+
+The ESP32 responds with:
+```
+PREF_BEGIN → PREF_ITEM × 9 → PREF_END
+INFO_BEGIN → INFO_ITEM × 3 → INFO_END
+INFO_STATUS
+```
+
+If prefs are not received within ~2 s, the Lua side retries the request.
+
+---
+
+## 8. Heartbeat & Serial Ownership
+
+The Tools script (`main.lua`) sends `PT_INFO_HEARTBEAT` every 50 ms
+**and** writes `getTime()` to SHM slot 1.
+
+The background Function script (`btwfs.lua`) reads SHM slot 1; if the
+heartbeat is < 80 ms old, it yields the serial port to the Tools script.
+This prevents both scripts from consuming the same UART bytes.
+
+On the firmware side, `s_lastToolsCmdMs` is updated on every valid frame
+received. If no frame is received for 15 s, the periodic 30 s resync is
+suspended to reduce traffic when the radio screen is idle.
+
+---
+
+## 9. Lua Module Summary
+
+| File                                    | Purpose                                          |
+|-----------------------------------------|--------------------------------------------------|
+| `BTWFS/lib/serial_proto.lua`            | Protocol constants, parser, builders, decoders   |
+| `BTWFS/lib/store.lua`                   | App state (prefs, info, channels, scan, status)  |
+| `BTWFS/main.lua`                        | Serial loop, dispatcher, SHM heartbeat           |
+| `BTWFS/pages/settings.lua`             | Data-driven settings list from `store.prefs`     |
+| `BTWFS/pages/dashboard.lua`            | Data-driven system section + live channel bars   |
+| `SCRIPTS/FUNCTIONS/btwfs.lua`          | Background: channel injection + TLM forward      |
+
 
 ---
 

@@ -74,6 +74,15 @@ return function(ctx)
     self._open      = false
     self._focusIdx  = 1   -- 1=left(Accept/OK), 2=right(Cancel)
 
+    -- Pre-split message into lines for centered multi-line rendering
+    self._lines = {}
+    local msg = self._message
+    if msg ~= "" then
+      for line in string.gmatch(msg .. "\n", "([^\n]*)\n") do
+        self._lines[#self._lines + 1] = line
+      end
+    end
+
     -- Color for this severity
     self._sevColor = SEV_COLORS[self._severity] or SEV_COLORS.info
 
@@ -214,9 +223,14 @@ return function(ctx)
 
     -- Vertically center text block between accent bar bottom and button/spinner top
     local accentBot = self._my + self._accentH
-    local hasMsg = self._message ~= "" and self._type ~= "confirm"
+    local hasMsg = #self._lines > 0 and self._type ~= "confirm"
+    local lineGap = scale.sy(4)
     local textBlockH = titleFH
-    if hasMsg then textBlockH = textBlockH + scale.sy(10) + theme.FH.small end
+    if hasMsg then
+      textBlockH = textBlockH + scale.sy(10)
+                 + theme.FH.small * #self._lines
+                 + lineGap * (#self._lines - 1)
+    end
 
     local btnTop
     if self._type == "info" then
@@ -233,13 +247,16 @@ return function(ctx)
     local tx = self._mx + math.floor((self._mw - tw) / 2)
     lcd.drawText(tx, titleY, self._title, titleFont + CUSTOM_COLOR)
 
-    -- Message text (for alert and info types)
+    -- Message text (for alert and info types) — each line centered
     if hasMsg then
-      local msgY = titleY + titleFH + scale.sy(10)
       lcd.setColor(CUSTOM_COLOR, theme.C.subtext)
-      local mw2 = lcd.sizeText and lcd.sizeText(self._message, theme.F.small) or 0
-      local mx2 = self._mx + math.floor((self._mw - mw2) / 2)
-      lcd.drawText(mx2, msgY, self._message, theme.F.small + CUSTOM_COLOR)
+      local lineY = titleY + titleFH + scale.sy(10)
+      for _, line in ipairs(self._lines) do
+        local lw = lcd.sizeText and lcd.sizeText(line, theme.F.small) or 0
+        local lx = self._mx + math.floor((self._mw - lw) / 2)
+        lcd.drawText(lx, lineY, line, theme.F.small + CUSTOM_COLOR)
+        lineY = lineY + theme.FH.small + lineGap
+      end
     end
 
     -- Buttons / loading

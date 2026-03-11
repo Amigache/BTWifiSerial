@@ -1,151 +1,147 @@
 -- btwfs.lua — BTWifiSerial background Function script
--- Reads serial channel data from ESP32-C3 and writes to GV1–GV8 (Flight Mode 0)
--- Optionally forwards radio S.PORT telemetry to ESP32 via T_TLM frames.
--- Yields incoming serial to the BTWifiSerial Tools script when it is active.
+-- New multi-channel serial protocol (CH/TYPE/LEN framing).
+--
+-- Responsibilities:
+--   1. Own the serial port when the Tools script is NOT active.
+--   2. Parse INFO_CHANNELS frames → inject channels into GV1–GV8 or TR1–TR8.
+--   3. Parse PREF_ITEM / PREF_UPDATE for MAP_MODE (pref id 5) to know GV/TR mode.
+--   4. Forward radio S.PORT telemetry to ESP32 as CH_TRANS / TRANS_SPORT frames.
+--   5. Update SHM slot 1 with getTime() so the Tools script can detect us.
 --
 -- SETUP:
 --   1. Copy to /SCRIPTS/FUNCTIONS/btwfs.lua
 --   2. Special Functions → SF1 → Switch: ON → Lua Script → btwfs
 
-local SYNC  = 0xAA
+local BASE_TOOLS = "/SCRIPTS/TOOLS/BTWFS"
+local proto = loadScript(BASE_TOOLS .. "/lib/serial_proto.lua")()
 
--- Frame types (must match lua_serial.cpp)
-local T_CH           = 0x43
-local T_ST           = 0x53
-local T_ACK          = 0x41
-local T_CFG          = 0x47
-local T_INF          = 0x49
-local T_SYS          = 0x59
-local T_SCAN_STATUS  = 0x44
-local T_SCAN_ENTRY   = 0x52
-local T_TLM          = 0x54  -- telemetry forward: Radio → ESP32
+-- ── Shared memory ─────────────────────────────────────────────────
+local SHM_TOOLS_HB = 1   -- Tools script writes getTime() here each frame
+local HB_STALE_MS  = 80  -- 8 ticks × 10 ms = 80 ms
 
+-- ── MAP_MODE cache (updated from PREF frames) ─────────────────────
+-- 0 = GV (global variables),  1 = TR (trainer channels)
+local PREF_ID_MAP_MODE = 0x05
+local mapMode = 0
+
+-- ── Channel injection ─────────────────────────────────────────────
 local NUM_CH = 8
+local CH_STALE_TICKS = 300   -- ≈ 3 s without a channels frame → stop injecting
+local _lastChannelTick = 0
 
--- Shared memory slot used by Tools script as heartbeat
-local SHM_TOOLS_HB = 1
-local SHM_MAP_MODE = 2  -- Trainer map mode: 0=GV, 1=TR
-local mapMode = 0       -- local cache (updated from SHM or T_CFG fallback)
+local function channelsAreFresh()
+  return _lastChannelTick > 0 and (getTime() - _lastChannelTick) < CH_STALE_TICKS
+end
+local function injectChannels(vals)
+  if mapMode == 1 then
+    -- TR mode: setTrainerChannels expects a table indexed 1-based, values -1024..1024
+    if setTrainerChannels then
+      setTrainerChannels(vals)
+    end
+  else
+    -- GV mode: write GV1..GV8 in flight-mode 0
+    for i = 1, NUM_CH do
+      local v = vals[i] or 0
+      if v < -1024 then v = -1024 elseif v > 1024 then v = 1024 end
+      pcall(model.setGlobalVariable, i - 1, 0, v)
+    end
+  end
+end
 
-local rxState  = 0
-local rxType   = 0
-local rxBuf    = {}
-local rxNeeded = 0
+-- ── Frame handler ─────────────────────────────────────────────────
+local function onFrame(ch, typ, payload)
+  if ch == proto.CH_INFO and typ == proto.PT_INFO_CHANNELS then
+    local vals = proto.decodeChannels(payload)
+    if vals then
+      _lastChannelTick = getTime()
+      injectChannels(vals)
+    end
 
-local function processByte(b)
-  if rxState == 0 then
-    if b == SYNC then rxState = 1 end
-  elseif rxState == 1 then
-    rxType = b; rxBuf = {b}
-    if     b == T_CH           then rxNeeded = 17; rxState = 2
-    elseif b == T_ST           then rxNeeded = 2;  rxState = 2
-    elseif b == T_ACK          then rxNeeded = 2;  rxState = 2
-    elseif b == T_CFG          then rxNeeded = 5;  rxState = 2
-    elseif b == T_INF          then rxNeeded = 13; rxState = 2
-    elseif b == T_SYS          then rxNeeded = 89; rxState = 2
-    elseif b == T_SCAN_STATUS  then rxNeeded = 3;  rxState = 2
-    elseif b == T_SCAN_ENTRY   then rxNeeded = 38; rxState = 2
-    else   rxState = (b == SYNC) and 1 or 0 end
-  elseif rxState == 2 then
-    rxBuf[#rxBuf + 1] = b
-    rxNeeded = rxNeeded - 1
-    if rxNeeded == 0 then
-      if rxType == T_CH then
-        local crc = 0
-        for i = 1, 17 do crc = bit32.bxor(crc, rxBuf[i]) end
-        if crc == rxBuf[18] then
-          -- Read map mode: prefer SHM (written by Tools), fall back to local cache
-          if getShmVar then
-            local sm = getShmVar(SHM_MAP_MODE)
-            if sm and sm >= 0 then mapMode = sm end
-          end
-          local trainerMode = (mapMode == 1) and (type(setTrainerChannels) == "function")
-          local tr = trainerMode and {}
-          for i = 0, NUM_CH - 1 do
-            local v = rxBuf[2 + i*2] * 256 + rxBuf[3 + i*2]
-            if v >= 32768 then v = v - 65536 end
-            v = math.max(-1024, math.min(1024, v))
-            if tr then
-              tr[i + 1] = math.floor(v / 2)
-            else
-              pcall(model.setGlobalVariable, i, 0, v)
-            end
-          end
-          if tr then pcall(setTrainerChannels, tr) end
-        end
-      elseif rxType == T_CFG then
-        -- Fallback: parse T_CFG to get mapMode when Tools script is not running
-        -- rxBuf[1]=T_CFG, [2]=apMode, [3]=devMode, [4]=tlmOut, [5]=mapMode, [6]=CRC
-        local crc = bit32.bxor(bit32.bxor(bit32.bxor(bit32.bxor(rxBuf[1], rxBuf[2]), rxBuf[3]), rxBuf[4]), rxBuf[5])
-        if crc == rxBuf[6] then
-          mapMode = rxBuf[5]  -- 0=GV, 1=TR
-        end
+  elseif ch == proto.CH_PREF then
+    -- Extract MAP_MODE from full PREF_ITEM or PREF_UPDATE
+    if typ == proto.PT_PREF_ITEM then
+      local p = proto.decodePrefPayload(payload, false)
+      if p and p.id == PREF_ID_MAP_MODE and p.type == proto.FT_ENUM then
+        mapMode = p.curIdx
       end
-      rxState = 0
+    elseif typ == proto.PT_PREF_UPDATE then
+      local p = proto.decodePrefPayload(payload, true)
+      if p and p.id == PREF_ID_MAP_MODE then
+        mapMode = p.curIdx or mapMode
+      end
+    end
+  end
+  -- All other channels/types are ignored by btwfs
+end
+
+local _parser = proto.newParser(onFrame)
+
+-- ── Telemetry forwarding (S.PORT → ESP32) ─────────────────────────
+local function forwardTelemetry()
+  if not sportTelemetryPop then return end
+  local physId, primId, dataId, value = sportTelemetryPop()
+  if physId then
+    -- Build TRANS_SPORT payload: physId(1) primId(1) dataId_lo(1) dataId_hi(1) value(4 LE)
+    local dlo = bit32.band(dataId,          0xFF)
+    local dhi = bit32.band(bit32.rshift(dataId, 8), 0xFF)
+    local v0  = bit32.band(value,           0xFF)
+    local v1  = bit32.band(bit32.rshift(value,  8), 0xFF)
+    local v2  = bit32.band(bit32.rshift(value, 16), 0xFF)
+    local v3  = bit32.band(bit32.rshift(value, 24), 0xFF)
+    if serialWrite then
+      serialWrite(proto.buildTrans(proto.PT_TRANS_SPORT,
+                                   { physId, primId, dlo, dhi, v0, v1, v2, v3 }))
     end
   end
 end
 
-local function init()
+-- ── Tools-script heartbeat check ──────────────────────────────────
+local function toolsIsActive()
+  if not getShmVar then return false end
+  local hb = getShmVar(SHM_TOOLS_HB)
+  if not hb or hb == 0 then return false end
+  -- getTime() returns 10 ms ticks; compare difference
+  local diff = getTime() - hb
+  return diff >= 0 and diff < (HB_STALE_MS / 10)
 end
 
--- sendTelemetry() — pop pending S.PORT packets and send as T_TLM frames.
--- Wrapped so it silently does nothing if sportTelemetryPop is unavailable.
-local hasTlmPop = nil  -- cached availability flag
+-- ── Reconnect probe (when stale and Tools is not active) ─────────
+local RECONNECT_INTERVAL = 100   -- ticks (≈ 1 s)
+local _reconnectTick = 0
 
-local function sendTelemetry()
-  if type(serialWrite) ~= "function" then return end
-  -- Check for sportTelemetryPop once (cache result)
-  if hasTlmPop == nil then
-    hasTlmPop = (type(sportTelemetryPop) == "function")
+-- ── EdgeTX callbacks ──────────────────────────────────────────────
+
+local function run(event)
+  if toolsIsActive() then
+    -- Tools script owns the serial port; only forward telemetry.
+    forwardTelemetry()
+    return 0
   end
-  if not hasTlmPop then return end
 
-  -- Pop up to 8 packets per frame to avoid stalling
-  for _ = 1, 8 do
-    local physId, primId, dataId, value = sportTelemetryPop()
-    if physId == nil then break end
-
-    -- Ensure value fits in uint32 (Lua may return negative for high bit set)
-    if value < 0 then value = value + 0x100000000 end
-
-    local di_lo = dataId % 256
-    local di_hi = math.floor(dataId / 256) % 256
-    local v0 = value % 256
-    local v1 = math.floor(value / 256) % 256
-    local v2 = math.floor(value / 65536) % 256
-    local v3 = math.floor(value / 16777216) % 256
-
-    -- CRC = XOR of all bytes from TYPE through last payload byte
-    local crc = bit32.bxor(T_TLM, physId, primId, di_lo, di_hi, v0, v1, v2, v3)
-    serialWrite(string.char(SYNC, T_TLM, physId, primId, di_lo, di_hi, v0, v1, v2, v3, crc))
-  end
-end
-
--- run(active) — called every frame by EdgeTX Function-script engine.
--- active: true when the Special Function switch is ON (ignored here; always run).
-local function run(active)
-  -- Yield *incoming* serial to Tools script while its heartbeat is fresh.
-  -- (writng T_TLM frames is independent and continues regardless.)
-  local toolsActive = false
-  if getShmVar then
-    local hb = getShmVar(SHM_TOOLS_HB)
-    if hb and hb > 0 and (getTime() - hb) < 8 then
-      toolsActive = true
+  -- Drain up to 64 bytes per tick
+  if serialRead then
+    local data = serialRead(64)
+    if data and #data > 0 then
+      for i = 1, #data do
+        _parser(string.byte(data, i))
+      end
     end
   end
 
-  if not toolsActive then
-    if type(serialRead) ~= "function" then return end
-    local d = serialRead(64)
-    if d and #d > 0 then
-      for i = 1, #d do processByte(string.byte(d, i)) end
+  -- If channel data has gone stale, probe the board every second so we
+  -- resume injection automatically when it comes back.
+  if not channelsAreFresh() then
+    local now = getTime()
+    if serialWrite and now - _reconnectTick >= RECONNECT_INTERVAL then
+      _reconnectTick = now
+      serialWrite(proto.buildInfoRequest())
+      serialWrite(proto.buildPrefRequest())
     end
   end
 
-  -- Forward radio telemetry regardless of Tools activity
-  sendTelemetry()
+  forwardTelemetry()
+  return 0
 end
 
--- Export both run and background so the script works on all EdgeTX versions.
-return { init=init, run=run, background=run }
+return { run = run }
+

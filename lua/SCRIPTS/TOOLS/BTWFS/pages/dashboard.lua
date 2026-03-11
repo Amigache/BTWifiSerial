@@ -1,5 +1,7 @@
 -- pages/dashboard.lua
--- Dashboard page: System info + Channel bars.
+-- Dashboard page — data-driven from store.
+-- System section: prefs with PF_DASHBOARD flag + info items (firmware-defined).
+-- Channels section: live channel bars polled from store.channels.
 
 return function(ctx)
   local Page       = ctx.Page
@@ -8,9 +10,48 @@ return function(ctx)
   local Grid       = ctx.Grid
   local ChannelBar = ctx.ChannelBar
   local scale      = ctx.scale
+  local proto      = ctx.proto
+  local store      = ctx.store
 
   local Dashboard = {}
   Dashboard.__index = Dashboard
+
+  -- Build system list rows from PF_DASHBOARD prefs + info items.
+  local function buildSysRows()
+    local rows = {}
+    -- Prefs flagged for dashboard display
+    for _, id in ipairs(store.prefsOrder) do
+      local p = store.prefs[id]
+      if p and bit32.band(p.flags, proto.PF_DASHBOARD) ~= 0 then
+        local val = "--"
+        if     p.type == proto.FT_ENUM   then val = p.options and p.options[p.curIdx + 1] or "?"
+        elseif p.type == proto.FT_STRING then val = p.value or ""
+        elseif p.type == proto.FT_INT    then val = tostring(p.value or 0)
+        elseif p.type == proto.FT_BOOL   then val = p.value and "On" or "Off"
+        end
+        rows[#rows + 1] = { _prefId = id, label = p.label, value = val }
+      end
+    end
+    -- Info items (firmware version, addresses, …)
+    for _, id in ipairs(store.infoOrder) do
+      local inf = store.info[id]
+      if inf then
+        local val = (inf.value ~= nil) and tostring(inf.value) or "--"
+        rows[#rows + 1] = { _infoId = id, label = inf.label, value = val }
+      end
+    end
+    return rows
+  end
+
+  -- Update only the row that corresponds to a changed pref or info item.
+  local function refreshRow(list, keyField, id, newVal)
+    for _, row in ipairs(list.rows) do
+      if row[keyField] == id then
+        row.value = newVal
+        return
+      end
+    end
+  end
 
   function Dashboard.new()
     local self = setmetatable({}, Dashboard)
@@ -22,6 +63,7 @@ return function(ctx)
       hasPageTitle = true,
       pageTitle    = "Dashboard",
       hasFooter    = true,
+      indicators   = ctx.indicators,
     })
 
     -- ── Proportional layout ───────────────────────────────────────
@@ -54,13 +96,7 @@ return function(ctx)
         { key = "label" },
         { key = "value", xFrac = 0.54 },
       },
-      rows = {
-        { label = "Device Mode",  value = "--" },
-        { label = "BT Name",      value = "--" },
-        { label = "AP Mode",      value = "--" },
-        { label = "Telem Output", value = "--" },
-        { label = "Firmware",     value = "--" },
-      },
+      rows = buildSysRows(),  -- may be empty until prefs/info arrive
     })
 
     -- ── Channels section ──────────────────────────────────────────
@@ -101,21 +137,28 @@ return function(ctx)
     self._page:addChild(self._chSection)
     self._page:addChild(self._grid)
 
-    return self
-  end
+    -- ── React to store events ──────────────────────────────────────
+    -- Rebuild system rows whenever the full lists arrive.
+    store.on("prefs_ready", function() self._list:setRows(buildSysRows()) end)
+    store.on("info_ready",  function() self._list:setRows(buildSysRows()) end)
 
-  -- Call this each frame with live state data (5-row table)
-  function Dashboard:updateInfo(data)
-    self._list:setRows(data)
-  end
-
-  -- Call with array of 8 channel values (-1024..+1024)
-  function Dashboard:updateChannels(vals)
-    for i = 1, 8 do
-      if vals[i] and self._bars[i] then
-        self._bars[i]:setValue(vals[i])
+    -- Patch individual rows on incremental updates.
+    store.on("pref_changed", function(pref)
+      if bit32.band(pref.flags, proto.PF_DASHBOARD) == 0 then return end
+      local val
+      if     pref.type == proto.FT_ENUM   then val = pref.options and pref.options[pref.curIdx + 1] or "?"
+      elseif pref.type == proto.FT_STRING then val = pref.value or ""
+      elseif pref.type == proto.FT_INT    then val = tostring(pref.value or 0)
+      elseif pref.type == proto.FT_BOOL   then val = pref.value and "On" or "Off"
       end
-    end
+      refreshRow(self._list, "_prefId", pref.id, val)
+    end)
+
+    store.on("info_changed", function(inf)
+      refreshRow(self._list, "_infoId", inf.id, tostring(inf.value or "--"))
+    end)
+
+    return self
   end
 
   function Dashboard:handleEvent(event)
@@ -127,6 +170,12 @@ return function(ctx)
   end
 
   function Dashboard:render()
+    -- Refresh channel bars from store (polled — channels arrive ~100 Hz)
+    for i = 1, 8 do
+      if self._bars[i] then
+        self._bars[i]:setValue(store.channels[i] or 0)
+      end
+    end
     self._page:render()
   end
 

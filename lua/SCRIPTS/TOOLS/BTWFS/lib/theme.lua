@@ -54,10 +54,12 @@ M.F = {
 -- Actual bitmap font pixel heights for vertical centering.
 -- These are FIXED pixel values (EdgeTX fonts do not scale with resolution).
 -- MIDSIZE on 800x480 ≈ 36px; BOLD on smaller screens ≈ 18px.
+-- On non-big color displays F.body and F.small are both SMLSIZE (~12px);
+-- on B&W displays SMLSIZE is 8px.
 M.FH = {
-  title = big and 36 or 18,  -- MIDSIZE (big) / BOLD (small)
-  body  = big and 16 or 12,  -- normal 0-flag / SMLSIZE
-  small = big and 14 or  8,  -- SMLSIZE
+  title = big and 36 or 18,                        -- MIDSIZE (big) / BOLD (small)
+  body  = big and 16 or 12,                        -- normal 0-flag (big) / SMLSIZE (small)
+  small = M.isColor and (big and 14 or 12) or 8,  -- SMLSIZE: color-big≈14, color-small≈12, B&W=8
 }
 
 return M

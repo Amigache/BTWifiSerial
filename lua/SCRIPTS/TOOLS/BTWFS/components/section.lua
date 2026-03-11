@@ -12,6 +12,7 @@
 --   font       flag     title font                   (default theme.F.body)
 --   gapTL      number   gap from title-bottom to line (default scale.sy(14))
 --   gapLC      number   gap from line to content      (default scale.sy(12))
+--   marginTop  number   extra space above the title    (default 0)
 --
 -- Read-only after construction:
 --   section.contentY  → first Y pixel below the divider (ready for content)
@@ -37,6 +38,7 @@ return function(ctx)
     self.font        = props.font       or theme.F.body
     self.gapTL       = props.gapTL      or scale.sy(14)  -- title-bottom → line
     self.gapLC       = props.gapLC      or scale.sy(12)  -- line         → content
+    self.y           = self.y + (props.marginTop or 0)
 
     local lineY      = self.y + theme.FH.body + self.gapTL
     self.contentY    = lineY + 1 + self.gapLC

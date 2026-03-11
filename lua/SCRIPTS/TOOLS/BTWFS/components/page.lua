@@ -70,10 +70,11 @@ return function(ctx)
     if props.hasFooter then
       local fh = scale.sy(38)
       self.footer = Footer.new({
-        x = self.x,
-        y = bottomY - fh,
-        w = self.w,
-        h = fh,
+        x          = self.x,
+        y          = bottomY - fh,
+        w          = self.w,
+        h          = fh,
+        indicators = props.indicators or {},
       })
       bottomY = bottomY - fh
     else
