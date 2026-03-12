@@ -20,6 +20,7 @@
  *     {"cmd":"disconnectBt"}
  *     {"cmd":"save"}
  *     {"cmd":"reboot"}
+ *     {"cmd":"factoryReset"}
  *
  *   Server -> Client:
  *     {"type":"status", ...}
@@ -36,6 +37,7 @@
 
 #include <WiFi.h>
 #include <esp_wifi.h>
+#include <esp_mac.h>
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
 #include <Update.h>
@@ -63,9 +65,10 @@ static const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <style>
 :root{--bg:#0d1117;--sf:#161b22;--bd:#30363d;--ac:#58a6ff;--tx:#e6edf3;--mu:#8b949e;--ok:#3fb950;--er:#f85149;--wn:#d29922}
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--tx);padding:12px;max-width:460px;margin:0 auto;font-size:15px}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--tx);padding:12px;max-width:980px;margin:0 auto;font-size:15px}
 h1{text-align:center;color:var(--ac);margin-bottom:14px;font-size:1.1em;letter-spacing:.12em;text-transform:uppercase;font-weight:600}
-.card{background:var(--sf);border:1px solid var(--bd);border-radius:4px;padding:13px;margin-bottom:9px}
+#cards{column-count:2;column-gap:10px}
+.card{background:var(--sf);border:1px solid var(--bd);border-radius:4px;padding:13px;margin:0 0 10px;break-inside:avoid;display:inline-block;width:100%}
 .ct{color:var(--ac);font-size:.78em;font-weight:700;letter-spacing:.12em;text-transform:uppercase;margin-bottom:9px;padding-bottom:6px;border-bottom:1px solid var(--bd)}
 .row{display:flex;justify-content:space-between;align-items:center;padding:3px 0;font-size:.88em}
 .row .l{color:var(--mu)}.row .v{color:var(--tx);font-family:monospace;font-size:.92em}
@@ -74,10 +77,13 @@ h1{text-align:center;color:var(--ac);margin-bottom:14px;font-size:1.1em;letter-s
 label{display:block;font-size:.82em;color:var(--mu);margin-top:9px;margin-bottom:3px}
 select,input[type=text]{width:100%;padding:6px 8px;border:1px solid var(--bd);background:var(--bg);color:var(--tx);border-radius:3px;font-size:.9em}
 select:focus,input:focus{outline:none;border-color:var(--ac)}
-.btn{display:inline-flex;align-items:center;gap:4px;padding:5px 13px;border:1px solid var(--bd);border-radius:3px;cursor:pointer;font-size:.85em;background:var(--sf);color:var(--tx);transition:border-color .15s,color .15s;margin-top:7px;white-space:nowrap}
+.btn{display:inline-flex;align-items:center;gap:4px;padding:5px 13px;border:1px solid var(--bd);border-radius:3px;cursor:pointer;font-size:.85em;line-height:1;background:var(--sf);color:var(--tx);transition:border-color .15s,color .15s;margin-top:7px;white-space:nowrap}
 .btn:hover{border-color:var(--ac);color:var(--ac)}
 .btn.ac{background:var(--ac);color:#000;border-color:var(--ac)}.btn.ac:hover{background:#79b8ff;border-color:#79b8ff}
 .btn.er{border-color:var(--er);color:var(--er)}.btn.er:hover{background:var(--er);color:#fff;border-color:var(--er)}
+.btn.sys{min-width:132px;height:32px;justify-content:center}
+.btn.sys .ico{width:14px;display:inline-flex;align-items:center;justify-content:center;line-height:1}
+.btn.sys .lbl{line-height:1}
 .btn.sm{padding:3px 8px;font-size:.8em;margin-top:0}
 .irow{display:flex;gap:6px;margin-top:3px}
 .irow input{margin-top:0}
@@ -100,16 +106,25 @@ select:focus,input:focus{outline:none;border-color:var(--ac)}
 progress{width:100%;height:8px;margin-top:10px;display:none;accent-color:var(--ac);border-radius:4px}
 .msg{font-size:.82em;color:var(--wn);margin-top:6px;min-height:1.1em}
 .toast{position:fixed;top:0;left:0;right:0;padding:11px 16px;background:var(--ok);color:#fff;font-size:.85em;text-align:center;z-index:200;transform:translateY(-100%);transition:transform .3s ease}
+.toast.ok{background:var(--ok);color:#fff}
+.toast.info{background:var(--ac);color:#000}
+.toast.warn{background:var(--wn);color:#000}
+.toast.err{background:var(--er);color:#fff}
 .toast.show{transform:translateY(0)}
 .mbg{position:fixed;inset:0;background:rgba(13,17,23,.82);z-index:100;display:flex;align-items:center;justify-content:center}
 .mbox{background:var(--sf);border:1px solid var(--bd);border-radius:4px;padding:20px 18px;max-width:300px;width:92%}
 .mbox h3{color:var(--tx);font-size:.95em;margin-bottom:7px}
 .mbox p{color:var(--mu);font-size:.83em;margin-bottom:15px;line-height:1.4}
 .mbtns{display:flex;gap:8px;justify-content:flex-end}
+@media (max-width:760px){
+  #cards{column-count:1}
+}
 </style>
 </head>
 <body>
 <h1>&#x25C8; BTWifiSerial</h1>
+
+<div id="cards">
 
 <div class="card">
   <div class="ct">Status</div>
@@ -126,13 +141,13 @@ progress{width:100%;height:8px;margin-top:10px;display:none;accent-color:var(--a
 <div class="card">
   <div class="ct">System Config</div>
   <label>Device Mode</label>
-  <select id="selRole" onchange="selRoleChange(this)">
+  <select id="selRole" onchange="markSystemDirty()">
     <option value="trainer_in">Trainer IN (Central)</option>
     <option value="trainer_out">Trainer OUT (Peripheral)</option>
     <option value="telemetry">Telemetry</option>
   </select>
   <label>Serial Mode</label>
-  <select id="selMode" onchange="setSerialMode(this.value)">
+  <select id="selMode" onchange="systemSerialChanged()">
     <option value="frsky">FrSky Trainer (CC2540)</option>
     <option value="sbus">SBUS Trainer</option>
     <option value="sport_bt">S.PORT Telemetry (CC2540)</option>
@@ -141,25 +156,46 @@ progress{width:100%;height:8px;margin-top:10px;display:none;accent-color:var(--a
   </select>
   <div id="mapModeRow" style="display:none">
     <label>Trainer Map</label>
-    <select id="selMapMode" onchange="setMapMode(this.value)">
+    <select id="selMapMode" onchange="markSystemDirty()">
       <option value="gv">GV (Global Variables)</option>
       <option value="tr">TR (Trainer Channels)</option>
     </select>
   </div>
-  <label>BT Name</label>
-  <div class="irow">
-    <input type="text" id="inName" maxlength="15" placeholder="BTWifiSerial">
-    <button class="btn ac" onclick="setBtName()">Set</button>
+  <div style="text-align:right;margin-top:10px">
+    <button class="btn ac" onclick="saveSystem()">&#x1F4BE; Save &amp; Restart</button>
   </div>
-  <label>AP SSID</label>
-  <div class="irow">
-    <input type="text" id="inSsid" maxlength="15" placeholder="BTWifiSerial">
-    <button class="btn ac" onclick="setSsid()">Set</button>
+</div>
+
+<div class="card">
+  <div class="ct">WiFi Config</div>
+  <label>WiFi Mode</label>
+  <select id="selWifi" onchange="wifiModeChanged(this.value)">
+    <option value="off">Off (BLE only)</option>
+    <option value="ap">AP (Access Point)</option>
+    <option value="sta">STA (Connect to network)</option>
+  </select>
+  <div id="apCfg" style="display:none">
+    <label>AP SSID</label>
+    <div class="irow">
+      <input type="text" id="inSsid" maxlength="15" placeholder="BTWifiSerial" oninput="markWifiDirty()">
+    </div>
+    <label>AP Password</label>
+    <div class="irow">
+      <input type="text" id="inApPass" maxlength="15" placeholder="12345678" oninput="markWifiDirty()">
+    </div>
   </div>
-  <label>AP Password</label>
-  <div class="irow">
-    <input type="text" id="inApPass" maxlength="15" placeholder="12345678">
-    <button class="btn ac" onclick="setApPass()">Set</button>
+  <div id="staCfg" style="display:none">
+    <label>STA SSID</label>
+    <div class="irow">
+      <input type="text" id="inStaSsid" maxlength="31" placeholder="MyHomeWiFi" oninput="markWifiDirty()">
+    </div>
+    <label>STA Password</label>
+    <div class="irow">
+      <input type="text" id="inStaPass" maxlength="63" placeholder="" oninput="markWifiDirty()">
+    </div>
+  </div>
+  <div style="text-align:right;margin-top:10px">
+    <button class="btn ac" onclick="saveWifi()">&#x1F4BE; Save &amp; Restart</button>
   </div>
 </div>
 
@@ -191,15 +227,21 @@ progress{width:100%;height:8px;margin-top:10px;display:none;accent-color:var(--a
   </div>
 </div>
 
-<div class="card">
+<div class="card" id="btCard">
   <div class="ct">Bluetooth</div>
-</div>
-
-<div class="card" id="scanCard" style="display:none">
-  <div class="ct">BLE Scan</div>
-  <div id="cPeer" style="display:none"></div>
-  <button class="btn ac" id="btnScan" onclick="scanBt()" style="margin-top:8px">&#x25B6; Scan</button>
-  <div id="scanList"></div>
+  <label>BT Name</label>
+  <div class="irow">
+    <input type="text" id="inName" maxlength="15" placeholder="BTWifiSerial" oninput="markBluetoothDirty()">
+  </div>
+  <div style="text-align:right;margin-top:10px">
+    <button class="btn ac" onclick="saveBluetooth()">&#x1F4BE; Save</button>
+  </div>
+  <div id="scanCard" style="display:none;margin-top:10px">
+    <label class="ct">BLE Scan</label>
+    <div id="cPeer" style="display:none"></div>
+    <button class="btn ac" id="btnScan" onclick="scanBt()" style="margin-top:8px">&#x25B6; Scan</button>
+    <div id="scanList"></div>
+  </div>
 </div>
 
 <div class="card" id="perCard" style="display:none">
@@ -217,17 +259,17 @@ progress{width:100%;height:8px;margin-top:10px;display:none;accent-color:var(--a
   <progress id="otaPrg" max="100" value="0"></progress>
   <div id="otaMsg" class="msg"></div>
   <button class="btn ac" id="btnOta" onclick="doOta()" style="display:none">&#x21A5;&nbsp;Upload</button>
+  <div class="ct" style="margin-top:10px">System Actions</div>
+  <button class="btn sys" style="border-color:var(--wn);color:var(--wn)" onclick="factoryReset()"><span class="ico">&#x26A0;</span><span class="lbl">Factory Reset</span></button>
+  <button class="btn er sys" onclick="reboot()"><span class="ico">&#x21BA;</span><span class="lbl">Reboot</span></button>
 </div>
 
-<div class="card" style="text-align:right">
-  <button class="btn er" onclick="reboot()">&#x21BA;&nbsp;Reboot</button>
 </div>
 
 <div id="rbOverlay" style="display:none;position:fixed;inset:0;background:#0d1117;z-index:99;align-items:center;justify-content:center;flex-direction:column;gap:14px">
   <span style="color:#e6edf3;font-size:1.3em;font-weight:600;letter-spacing:.04em">&#x25C8;&nbsp;BTWifiSerial</span>
   <span style="color:#6e7681;font-size:.82em;max-width:280px;text-align:center;line-height:1.5">
-    Device has rebooted in normal mode.<br>
-    To return to the configuration page, briefly press the Boot button, connect to the AP and reload.
+    Device is rebooting. Reconnect to access the configuration page.
   </span>
 </div>
 
@@ -243,7 +285,17 @@ progress{width:100%;height:8px;margin-top:10px;display:none;accent-color:var(--a
 </div>
 
 <script>
-let ws,rTimer,prevRole='';
+let ws,rTimer;
+let systemDirty=false;
+let bluetoothDirty=false;
+let wifiDirty=false;
+let telemDirty=false;
+
+// BLE connection state tracking
+let lastBleConnected=false;
+let bleConnectPending=false;
+let bleConnectTimer=null;
+let toastTimer=null;
 
 // ── WebSocket ──
 function initWS(){
@@ -254,7 +306,15 @@ function initWS(){
   ws.onclose=()=>{rTimer=setTimeout(initWS,3000);};
   ws.onmessage=(e)=>handle(JSON.parse(e.data));
 }
-function send(o){if(ws&&ws.readyState===1)ws.send(JSON.stringify(o));}
+function send(o){
+  if(ws&&ws.readyState===1){
+    ws.send(JSON.stringify(o));
+    return true;
+  }
+  showToast('WebSocket disconnected. Reconnecting...',5000,'warn');
+  initWS();
+  return false;
+}
 function getStatus(){send({cmd:'getStatus'});}
 
 // ── Reboot overlay: show static goodbye screen, close WS ──
@@ -275,16 +335,49 @@ function modalOk(){document.getElementById('modal').style.display='none';if(mCb)
 function modalCancel(){
   document.getElementById('modal').style.display='none';
   mCb=null;
-  // If role select was reverted, restore prevRole
-  const s=document.getElementById('selRole');
-  if(prevRole)s.value=prevRole;
 }
 
 // ── Message handler ──
 function handle(m){
   if(m.type==='ack'&&m.reboot){showReboot();return;}
+  if(m.type==='ack'){
+    if(m.cmd==='connectBt' && m.ok===false){
+      clearTimeout(bleConnectTimer);
+      bleConnectPending=false;
+      showToast('✗ Connection failed',5000,'err');
+      return;
+    }
+    if(m.cmd==='disconnectBt' && m.ok===false){
+      showToast('✗ Disconnect failed',4000,'err');
+      return;
+    }
+    if(m.cmd==='forgetBt' && m.ok===false){
+      showToast('✗ Forget failed',4000,'err');
+      return;
+    }
+  }
   if(m.type==='status'){
     const ok=m.bleConnected;
+    
+    // Detect BLE connection state changes
+    if(bleConnectPending && !ok){
+      // Still waiting for connection (timeout not yet reached)
+    } else if(bleConnectPending && ok){
+      // Connection succeeded!
+      clearTimeout(bleConnectTimer);
+      bleConnectPending=false;
+      showToast('✓ Connected successfully',3000,'ok');
+    } else if(!lastBleConnected && ok){
+      // Spontaneous connection (auto-reconnect)
+      showToast('✓ Connected',3000,'ok');
+    } else if(lastBleConnected && !ok){
+      // Just disconnected
+      if(!bleConnectPending){
+        showToast('⚠ Disconnected',4000,'warn');
+      }
+    }
+    lastBleConnected=ok;
+    
     document.getElementById('bDot').className='dot '+(ok?'ok':'er');
     document.getElementById('bSt').textContent=ok?'Connected':'Disconnected';
     document.getElementById('sMode').textContent=m.serialMode||'--';
@@ -296,31 +389,46 @@ function handle(m){
     document.getElementById('lAddr').textContent=m.localAddr||'--';
     document.getElementById('rAddr').textContent=m.remoteAddr||'--';
     document.getElementById('bTs').textContent=m.buildTs||'--';
-    document.getElementById('selMode').value=m.serialMode;
-    const rs=document.getElementById('selRole');
-    rs.value=m.deviceMode; prevRole=m.deviceMode;
-    if(document.getElementById('inName')!==document.activeElement)
+    if(!systemDirty){
+      document.getElementById('selMode').value=m.serialMode;
+      document.getElementById('selRole').value=m.deviceMode;
+      document.getElementById('selMapMode').value=m.mapMode||'gv';
+      const isLuaDraft=m.serialMode==='lua_serial';
+      document.getElementById('mapModeRow').style.display=isLuaDraft?'':'none';
+    }
+    if(!bluetoothDirty && document.getElementById('inName')!==document.activeElement)
       document.getElementById('inName').value=m.btName||'';
-    if(document.getElementById('inSsid')!==document.activeElement)
+    if(!wifiDirty && m.apSsid!==undefined && document.getElementById('inSsid')!==document.activeElement)
       document.getElementById('inSsid').value=m.apSsid||'';
-    if(document.getElementById('inApPass')!==document.activeElement)
+    if(!wifiDirty && m.apPass!==undefined && document.getElementById('inApPass')!==document.activeElement)
       document.getElementById('inApPass').value=m.apPass||'';
+    // WiFi mode select + section visibility — only update when field is present
+    if(!wifiDirty && m.wifiMode!==undefined){
+      document.getElementById('selWifi').value=m.wifiMode;
+      wifiModeToggle(m.wifiMode);
+    }
+    if(!wifiDirty && m.staSsid!==undefined && document.getElementById('inStaSsid')!==document.activeElement)
+      document.getElementById('inStaSsid').value=m.staSsid||'';
+    if(!wifiDirty && m.staPass!==undefined && document.getElementById('inStaPass')!==document.activeElement)
+      document.getElementById('inStaPass').value=m.staPass||'';
     document.getElementById('scanCard').style.display=m.deviceMode==='trainer_in'?'':'none';
     document.getElementById('perCard').style.display=m.deviceMode==='trainer_out'?'':'none';
     // Trainer map mode visibility (LUA Serial only)
     const isLua=m.serialMode==='lua_serial';
-    document.getElementById('mapModeRow').style.display=isLua?'':'none';
-    if(isLua) document.getElementById('selMapMode').value=m.mapMode||'gv';
+    if(!systemDirty){
+      document.getElementById('mapModeRow').style.display=isLua?'':'none';
+      if(isLua) document.getElementById('selMapMode').value=m.mapMode||'gv';
+    }
     // Telemetry card visibility
     const isTelem=m.serialMode==='sport_bt'||m.serialMode==='sport_mirror';
     document.getElementById('telemCard').style.display=isTelem?'':'none';
     if(isTelem){
-      document.getElementById('selTelemOut').value=m.telemOutput||'wifi_udp';
+      if(!telemDirty) document.getElementById('selTelemOut').value=m.telemOutput||'wifi_udp';
       document.getElementById('mirrorBaudRow').style.display=m.serialMode==='sport_mirror'?'':'none';
-      if(m.serialMode==='sport_mirror') document.getElementById('selBaud').value=m.sportBaud||'57600';
+      if(m.serialMode==='sport_mirror' && !telemDirty) document.getElementById('selBaud').value=m.sportBaud||'57600';
       const isUdp=(m.telemOutput||'wifi_udp')==='wifi_udp';
       document.getElementById('udpCfg').style.display=isUdp?'':'none';
-      if(isUdp){
+      if(isUdp && !telemDirty){
         const up=document.getElementById('inUdpPort');
         if(up!==document.activeElement)up.value=m.udpPort||'5010';
       }
@@ -374,33 +482,115 @@ function handle(m){
 }
 
 // ── Actions ──
-function setSerialMode(v){send({cmd:'setSerialMode',value:v});}
-function setTelemOutput(v){send({cmd:'setTelemOutput',value:v});}
-function setMirrorBaud(v){send({cmd:'setMirrorBaud',value:v});}
-function setMapMode(v){send({cmd:'setMapMode',value:v});}
-function setUdpPort(){send({cmd:'setUdpPort',value:document.getElementById('inUdpPort').value});}
-function setBtName(){send({cmd:'setBtName',value:document.getElementById('inName').value});}
-function setSsid(){showConfirm('Change SSID','Change AP SSID? The device will restart.',function(){send({cmd:'setSsid',value:document.getElementById('inSsid').value});});}
-function setApPass(){showConfirm('Change AP Password','Change password (min 8 chars)? The device will restart.',function(){send({cmd:'setApPass',value:document.getElementById('inApPass').value});});}
-function selRoleChange(sel){
-  const nv=sel.value;
-  sel.value=prevRole; // revert until confirmed
-  showConfirm('Change Device Mode','Change mode to "'+nv+'"? The device will restart.',function(){
-    prevRole=nv; sel.value=nv;
-    send({cmd:'setDeviceMode',value:nv});
+function setTelemOutput(v){
+  if(send({cmd:'setTelemOutput',value:v})) showToast('Telemetry output updated',2500,'ok');
+}
+function setMirrorBaud(v){
+  if(send({cmd:'setMirrorBaud',value:v})) showToast('Mirror baud updated',2500,'ok');
+}
+function setUdpPort(){
+  telemDirty=true;
+  if(send({cmd:'setUdpPort',value:document.getElementById('inUdpPort').value})) {
+    showToast('UDP port updated',2500,'ok');
+  }
+}
+function markSystemDirty(){systemDirty=true;}
+function systemSerialChanged(){
+  markSystemDirty();
+  const isLua=document.getElementById('selMode').value==='lua_serial';
+  document.getElementById('mapModeRow').style.display=isLua?'':'none';
+}
+function markBluetoothDirty(){bluetoothDirty=true;}
+function markWifiDirty(){wifiDirty=true;}
+function wifiModeChanged(v){markWifiDirty();wifiModeToggle(v);}
+function saveSystem(){
+  const d={
+    cmd:'saveSystem',
+    deviceMode:document.getElementById('selRole').value,
+    serialMode:document.getElementById('selMode').value,
+    mapMode:document.getElementById('selMapMode').value
+  };
+  showConfirm('Save System Config','Save System settings and restart the device?',function(){
+    systemDirty=false;
+    if(send(d)) showReboot();
   });
 }
-function scanBt(){send({cmd:'scanBt'});}
-function connectBt(a){send({cmd:'connectBt',value:a});setTimeout(getStatus,1500);}
-function disconnectBt(){send({cmd:'disconnectBt'});setTimeout(getStatus,500);}
-function forgetBt(){send({cmd:'forgetBt'});setTimeout(getStatus,500);}
+function saveBluetooth(){
+  const d={cmd:'saveBluetooth',btName:document.getElementById('inName').value};
+  showConfirm('Save Bluetooth Config','Save Bluetooth settings?',function(){
+    bluetoothDirty=false;
+    send(d);
+  });
+}
+function wifiModeToggle(v){
+  document.getElementById('apCfg').style.display=v==='ap'?'':'none';
+  document.getElementById('staCfg').style.display=v==='sta'?'':'none';
+}
+function saveWifi(){
+  const wm=document.getElementById('selWifi').value;
+  const d={cmd:'saveWifi',wifiMode:wm};
+  if(wm==='ap'){
+    d.apSsid=document.getElementById('inSsid').value;
+    d.apPass=document.getElementById('inApPass').value;
+  }else if(wm==='sta'){
+    d.staSsid=document.getElementById('inStaSsid').value;
+    d.staPass=document.getElementById('inStaPass').value;
+  }
+  showConfirm('Save WiFi Config','Save WiFi settings and restart the device?',function(){
+    wifiDirty=false;
+    if(send(d)) showReboot();
+  });
+}
+function scanBt(){
+  if(send({cmd:'scanBt'})) showToast('Scanning for devices...',2500,'info');
+}
+function connectBt(a){
+  if(bleConnectPending){
+    showToast('⚠ Connection already in progress',3000,'warn');
+    return;
+  }
+  if(send({cmd:'connectBt',value:a})) {
+    bleConnectPending=true;
+    clearTimeout(bleConnectTimer);
+    showToast('Connecting...',0,'info');
+    // BLE timeout is 5s; wait 7s before declaring failure
+    bleConnectTimer=setTimeout(function(){
+      if(bleConnectPending && !lastBleConnected){
+        bleConnectPending=false;
+        showToast('✗ Connection failed (timeout)',5000,'err');
+      }
+    }, 7000);
+  }
+}
+function disconnectBt(){
+  if(send({cmd:'disconnectBt'})) {
+    clearTimeout(bleConnectTimer);
+    bleConnectPending=false;
+    showToast('Disconnecting...',2500,'info');
+    setTimeout(getStatus, 500);
+  }
+}
+function forgetBt(){
+  if(send({cmd:'forgetBt'})) {
+    clearTimeout(bleConnectTimer);
+    bleConnectPending=false;
+    showToast('Device forgotten',3000,'warn');
+    setTimeout(getStatus, 500);
+  }
+}
 function disconnectClient(){send({cmd:'disconnectClient'});}
 function reboot(){
   showConfirm('Reboot Device',
     'After rebooting the device will start in normal mode and will not return to the configuration page.',
     function(){
-      send({cmd:'reboot'});
-      showReboot();
+      if(send({cmd:'reboot'})) showReboot();
+    });
+}
+function factoryReset(){
+  showConfirm('Factory Reset',
+    'Restore default configuration and reboot? This will erase saved settings (WiFi, BLE pairing, modes).',
+    function(){
+      if(send({cmd:'factoryReset'})) showReboot();
     });
 }
 const drop=document.getElementById('otaDrop');
@@ -413,7 +603,16 @@ function setFile(f){
   document.getElementById('ofn').textContent=f.name+' ('+Math.round(f.size/1024)+' KB)';
   document.getElementById('btnOta').style.display='inline-flex';
 }
-function showToast(m,d){const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),d||4000);}
+function showToast(m,d,type){
+  const t=document.getElementById('toast');
+  if(toastTimer){clearTimeout(toastTimer);toastTimer=null;}
+  t.classList.remove('ok','info','warn','err');
+  t.classList.add(type||'ok');
+  t.textContent=m;
+  t.classList.add('show');
+  if(d===0)return;
+  toastTimer=setTimeout(()=>{t.classList.remove('show');toastTimer=null;},d||4000);
+}
 function doOta(){
   const f=fin.files[0];if(!f)return;
   const pg=document.getElementById('otaPrg'),msg=document.getElementById('otaMsg'),btn=document.getElementById('btnOta');
@@ -423,7 +622,7 @@ function doOta(){
   x.upload.onprogress=(ev)=>{if(ev.lengthComputable){const p=Math.round(ev.loaded/ev.total*100);pg.value=p;msg.textContent='Uploading\u2026 '+p+'%';}};
   x.onload=()=>{
     if(x.status===200 && x.responseText==='OK'){
-      pg.value=100;msg.textContent='Upload complete \u2014 rebooting into AP mode\u2026';
+      pg.value=100;msg.textContent='Upload complete \u2014 rebooting and restoring current WiFi mode\u2026';
       let att=0;
       const id=setInterval(()=>{
         att++;
@@ -479,6 +678,22 @@ static void handleWebSocketMessage(AsyncWebSocketClient* client, uint8_t* data, 
         resp["btName"]     = g_config.btName;
         resp["apSsid"]     = g_config.apSsid;
         resp["apPass"]     = g_config.apPass;
+        resp["staSsid"]    = g_config.staSsid;
+        resp["staPass"]    = g_config.staPass;
+        // WiFi mode: report what is actually running, not just what is configured.
+        // The button can boot into AP/STA without changing g_config.wifiMode.
+        if (s_active) {
+            wifi_mode_t wm = WiFi.getMode();
+            if (wm == WIFI_AP || wm == WIFI_AP_STA)  resp["wifiMode"] = "ap";
+            else if (wm == WIFI_STA)                  resp["wifiMode"] = "sta";
+            else                                       resp["wifiMode"] = "off";
+        } else {
+            switch (g_config.wifiMode) {
+                case WifiMode::AP:  resp["wifiMode"] = "ap";  break;
+                case WifiMode::STA: resp["wifiMode"] = "sta"; break;
+                default:            resp["wifiMode"] = "off"; break;
+            }
+        }
         resp["buildTs"]    = BUILD_TIMESTAMP;
 
         // Use live address if BLE is running, otherwise fall back to config cache
@@ -519,35 +734,52 @@ static void handleWebSocketMessage(AsyncWebSocketClient* client, uint8_t* data, 
             }
         }
     }
-    // ─── setMapMode ─────────────────────────────────────────────
-    else if (strcmp(cmd, "setMapMode") == 0) {
-        const char* val = doc["value"];
-        if (val) {
-            g_config.trainerMapMode = (strcmp(val, "tr") == 0)
-                                      ? TrainerMapMode::MAP_TR
-                                      : TrainerMapMode::MAP_GV;
-            LOG_I("WEB", "Trainer map mode set to %s", val);
-            configSave();
-        }
-        resp["type"] = "ack";
-        resp["cmd"]  = cmd;
-        resp["ok"]   = true;
-    }
-    // ─── setSerialMode ──────────────────────────────────────────
-    else if (strcmp(cmd, "setSerialMode") == 0) {
-        const char* val = doc["value"];
-        if (val) {
-            if      (strcmp(val, "sbus") == 0)         g_config.serialMode = OutputMode::SBUS;
-            else if (strcmp(val, "sport_bt") == 0)     g_config.serialMode = OutputMode::SPORT_BT;
-            else if (strcmp(val, "sport_mirror") == 0) g_config.serialMode = OutputMode::SPORT_MIRROR;
-            else if (strcmp(val, "lua_serial") == 0)   g_config.serialMode = OutputMode::LUA_SERIAL;
-            else                                       g_config.serialMode = OutputMode::FRSKY;
-            LOG_I("WEB", "Serial mode set to %s", val);
-            configSave();
-        }
-        resp["type"] = "ack";
-        resp["cmd"]  = cmd;
-        resp["ok"]   = true;
+    // ─── saveSystem ─────────────────────────────────────────────
+    else if (strcmp(cmd, "saveSystem") == 0) {
+      const char* serial = doc["serialMode"];
+      const char* dev    = doc["deviceMode"];
+      const char* map    = doc["mapMode"];
+
+      if (serial) {
+        if      (strcmp(serial, "sbus") == 0)         g_config.serialMode = OutputMode::SBUS;
+        else if (strcmp(serial, "sport_bt") == 0)     g_config.serialMode = OutputMode::SPORT_BT;
+        else if (strcmp(serial, "sport_mirror") == 0) g_config.serialMode = OutputMode::SPORT_MIRROR;
+        else if (strcmp(serial, "lua_serial") == 0)   g_config.serialMode = OutputMode::LUA_SERIAL;
+        else                                            g_config.serialMode = OutputMode::FRSKY;
+      }
+
+      if (dev) {
+        if      (strcmp(dev, "trainer_in") == 0)  g_config.deviceMode = DeviceMode::TRAINER_IN;
+        else if (strcmp(dev, "trainer_out") == 0) g_config.deviceMode = DeviceMode::TRAINER_OUT;
+        else if (strcmp(dev, "telemetry") == 0)   g_config.deviceMode = DeviceMode::TELEMETRY;
+      }
+
+      if (map) {
+        g_config.trainerMapMode = (strcmp(map, "tr") == 0)
+                      ? TrainerMapMode::MAP_TR
+                      : TrainerMapMode::MAP_GV;
+      }
+
+      LOG_I("WEB", "System config saved — restarting");
+      configSave();
+
+      resp["type"]   = "ack";
+      resp["cmd"]    = cmd;
+      resp["ok"]     = true;
+      resp["reboot"] = true;
+      { String out; serializeJson(resp, out); client->text(out); }
+      delay(400);
+      uint8_t bootMode = 1;  // BOOT_AP_MODE default
+      wifi_mode_t wm = WiFi.getMode();
+      if (wm == WIFI_STA || wm == WIFI_AP_STA) {
+          bootMode = 3;  // BOOT_STA_MODE
+      } else if (g_config.serialMode == OutputMode::LUA_SERIAL &&
+                 g_config.telemetryOutput == TelemetryOutput::WIFI_UDP) {
+          bootMode = 2;  // BOOT_TELEM_AP
+      }
+      { Preferences p; p.begin("btwboot", false); p.putUChar("mode", bootMode); p.end(); }
+      ESP.restart();
+      return;
     }
     // ─── setTelemOutput ─────────────────────────────────────────
     else if (strcmp(cmd, "setTelemOutput") == 0) {
@@ -579,82 +811,76 @@ static void handleWebSocketMessage(AsyncWebSocketClient* client, uint8_t* data, 
     else if (strcmp(cmd, "setUdpPort") == 0) {
         const char* val = doc["value"];
         if (val) {
-            g_config.udpPort = (uint16_t)atoi(val);
-            LOG_I("WEB", "UDP port set to %u", g_config.udpPort);
-            configSave();
+            int port = atoi(val);
+            if (port > 0 && port <= 65535) {
+                g_config.udpPort = (uint16_t)port;
+                LOG_I("WEB", "UDP port set to %u", g_config.udpPort);
+                configSave();
+                resp["ok"] = true;
+            } else {
+                LOG_W("WEB", "Invalid UDP port: %d (must be 1-65535)", port);
+                resp["ok"] = false;
+            }
+        } else {
+            resp["ok"] = false;
         }
         resp["type"] = "ack";
         resp["cmd"]  = cmd;
-        resp["ok"]   = true;
     }
-    // ─── setBtName ──────────────────────────────────────────────
-    else if (strcmp(cmd, "setBtName") == 0) {
-        const char* val = doc["value"];
-        if (val && strlen(val) > 0) {
-            strlcpy(g_config.btName, val, sizeof(g_config.btName));
-            LOG_I("WEB", "BT name set to %s", val);
-            configSave();
-            // Lightweight: just restart advertising with new name, no BLE stack restart
-            bleUpdateAdvertisingName();
-        }
-        resp["type"] = "ack";
-        resp["cmd"]  = cmd;
-        resp["ok"]   = true;
+    // ─── saveBluetooth ───────────────────────────────────────────
+    else if (strcmp(cmd, "saveBluetooth") == 0) {
+      const char* name = doc["btName"];
+      bool ok = (name && strlen(name) > 0);
+      if (ok) {
+        strlcpy(g_config.btName, name, sizeof(g_config.btName));
+        LOG_I("WEB", "Bluetooth config saved: name=%s", name);
+        configSave();
+        bleUpdateAdvertisingName();
+      }
+      resp["type"] = "ack";
+      resp["cmd"]  = cmd;
+      resp["ok"]   = ok;
     }
-    // ─── setSsid ────────────────────────────────────────────────
-    else if (strcmp(cmd, "setSsid") == 0) {
-        const char* val = doc["value"];
-        if (val && strlen(val) > 0) {
-            strlcpy(g_config.apSsid, val, sizeof(g_config.apSsid));
-            LOG_I("WEB", "AP SSID set to %s — restarting", val);
-            configSave();
+    // ─── saveWifi ─────────────────────────────────────────────
+    else if (strcmp(cmd, "saveWifi") == 0) {
+        const char* wm = doc["wifiMode"];
+        WifiMode newMode = WifiMode::OFF;
+        if (wm) {
+            if      (strcmp(wm, "ap")  == 0) newMode = WifiMode::AP;
+            else if (strcmp(wm, "sta") == 0) newMode = WifiMode::STA;
         }
+        g_config.wifiMode = newMode;
+
+        if (newMode == WifiMode::AP) {
+            const char* ss = doc["apSsid"];
+            const char* pw = doc["apPass"];
+            if (ss && strlen(ss) > 0)
+                strlcpy(g_config.apSsid, ss, sizeof(g_config.apSsid));
+            if (pw && strlen(pw) >= 8)
+                strlcpy(g_config.apPass, pw, sizeof(g_config.apPass));
+        } else if (newMode == WifiMode::STA) {
+            const char* ss = doc["staSsid"];
+            const char* pw = doc["staPass"];
+            if (ss && strlen(ss) > 0)
+                strlcpy(g_config.staSsid, ss, sizeof(g_config.staSsid));
+            if (pw)
+                strlcpy(g_config.staPass, pw, sizeof(g_config.staPass));
+        }
+
+        LOG_I("WEB", "WiFi config saved: mode=%s — restarting", wm ? wm : "off");
+        configSave();
+
+        uint8_t bootMode = 0;  // BOOT_NORMAL
+        if      (newMode == WifiMode::AP)  bootMode = 1;
+        else if (newMode == WifiMode::STA) bootMode = 3;
+
         resp["type"]   = "ack";
         resp["cmd"]    = cmd;
         resp["ok"]     = true;
         resp["reboot"] = true;
         { String out; serializeJson(resp, out); client->text(out); }
         delay(400);
-        ESP.restart();
-        return;
-    }
-    // ─── setApPass ──────────────────────────────────────────────
-    else if (strcmp(cmd, "setApPass") == 0) {
-        const char* val = doc["value"];
-        bool ok = (val && strlen(val) >= 8);
-        if (ok) {
-            strlcpy(g_config.apPass, val, sizeof(g_config.apPass));
-            LOG_I("WEB", "AP pass updated — restarting");
-            configSave();
-        }
-        resp["type"]   = "ack";
-        resp["cmd"]    = cmd;
-        resp["ok"]     = ok;
-        resp["reboot"] = true;
-        { String out; serializeJson(resp, out); client->text(out); }
-        delay(400);
-        ESP.restart();
-        return;
-    }
-    // ─── setDeviceMode ────────────────────────────────────────────
-    else if (strcmp(cmd, "setDeviceMode") == 0) {
-        const char* val = doc["value"];
-        if (val) {
-            if (strcmp(val, "trainer_in") == 0)       g_config.deviceMode = DeviceMode::TRAINER_IN;
-            else if (strcmp(val, "trainer_out") == 0) g_config.deviceMode = DeviceMode::TRAINER_OUT;
-            else if (strcmp(val, "telemetry") == 0)   g_config.deviceMode = DeviceMode::TELEMETRY;
-            LOG_I("WEB", "Device mode set to %s — restarting to AP mode", val);
-            configSave();
-        }
-        // Role change requires full BLE stack reinit (NimBLE deinit is unsafe from
-        // loop task while connected). Restart ESP keeping AP mode flag set.
-        resp["type"]   = "ack";
-        resp["cmd"]    = cmd;
-        resp["ok"]     = true;
-        resp["reboot"] = true;
-        { String out; serializeJson(resp, out); client->text(out); }
-        delay(400);
-        { Preferences p; p.begin("btwboot", false); p.putUChar("mode", 1); p.end(); }
+        { Preferences p; p.begin("btwboot", false); p.putUChar("mode", bootMode); p.end(); }
         ESP.restart();
         return;
     }
@@ -693,13 +919,6 @@ static void handleWebSocketMessage(AsyncWebSocketClient* client, uint8_t* data, 
         resp["cmd"]  = cmd;
         resp["ok"]   = true;
     }
-    // ─── save ───────────────────────────────────────────────────
-    else if (strcmp(cmd, "save") == 0) {
-        configSave();
-        resp["type"] = "ack";
-        resp["cmd"]  = cmd;
-        resp["ok"]   = true;
-    }
     // ─── reboot ─────────────────────────────────────────────────
     else if (strcmp(cmd, "reboot") == 0) {
         resp["type"] = "ack";
@@ -711,17 +930,42 @@ static void handleWebSocketMessage(AsyncWebSocketClient* client, uint8_t* data, 
         client->text(out);
         delay(300);
         // Write the correct boot mode before restart so the device lands in
-        // the right state: LUA Serial + WiFi UDP → TELEM_AP (WebUI stays up,
-        // Lua not blocked); everything else → BOOT_NORMAL (setup() decides).
-        if (g_config.serialMode == OutputMode::LUA_SERIAL &&
-            g_config.telemetryOutput == TelemetryOutput::WIFI_UDP) {
-            Preferences p; p.begin("btwboot", false);
-            p.putUChar("mode", 2);  // BOOT_TELEM_AP
-            p.end();
+        // the right state based on the configured WiFi mode.
+        // LUA Serial + WiFi UDP with AP/STA mode: use TELEM_AP so WebUI stays up.
+        uint8_t bm = 0;  // BOOT_NORMAL
+        if (g_config.wifiMode == WifiMode::AP) {
+            bm = (g_config.serialMode == OutputMode::LUA_SERIAL &&
+                  g_config.telemetryOutput == TelemetryOutput::WIFI_UDP) ? 2 : 1;
+        } else if (g_config.wifiMode == WifiMode::STA) {
+            bm = 3;  // BOOT_STA_MODE
         }
+        { Preferences p; p.begin("btwboot", false); p.putUChar("mode", bm); p.end(); }
         ESP.restart();
         return;
     }
+      // ─── factoryReset ───────────────────────────────────────────
+      else if (strcmp(cmd, "factoryReset") == 0) {
+        LOG_W("WEB", "Factory reset requested from Web UI");
+
+        g_config.setDefaults();
+        configSave();
+
+        resp["type"]   = "ack";
+        resp["cmd"]    = cmd;
+        resp["ok"]     = true;
+        resp["reboot"] = true;
+
+        String out;
+        serializeJson(resp, out);
+        client->text(out);
+        delay(300);
+
+        // Defaults use WiFi OFF + LUA_SERIAL + Trainer IN.
+        // Boot in normal mode after reset.
+        { Preferences p; p.begin("btwboot", false); p.putUChar("mode", 0); p.end(); }
+        ESP.restart();
+        return;
+      }
     else {
         resp["type"] = "ack";
         resp["cmd"]  = cmd;
@@ -834,41 +1078,139 @@ void webUiInit() {
 
     // Prevent the WiFi driver from writing SSID/pass to NVS on its own
     WiFi.persistent(false);
-    WiFi.mode(WIFI_AP);
-    delay(100);  // let radio + netif settle
 
-    // Explicit params: channel 1, not hidden, max 4 clients
-    if (!WiFi.softAP(g_config.apSsid, g_config.apPass, 1, 0, 4)) {
-        LOG_E("WEB", "softAP() failed!");
-        WiFi.mode(WIFI_OFF);
-        return;
-    }
+    if (g_config.wifiMode == WifiMode::STA) {
+        // ── Station mode: connect to an existing WiFi network ──────────
 
-    // Wait until the AP interface has a valid IP (DHCP server ready)
-    {
-        uint32_t t0 = millis();
-        while (WiFi.softAPIP() == IPAddress(0, 0, 0, 0) && millis() - t0 < 3000) {
-            delay(50);
+        // Set a stable locally-administered MAC *before* WiFi.mode() initialises
+        // the driver. Using a deterministic value keeps DHCP identity stable,
+        // so STA IP tends to stay consistent across reboots.
+        {
+          uint8_t factoryMac[6];
+          esp_efuse_mac_get_default(factoryMac);
+          uint8_t stableMac[6];
+          memcpy(stableMac, factoryMac, sizeof(stableMac));
+          stableMac[0] = (stableMac[0] & 0xFE) | 0x02;  // unicast + local-admin
+          esp_base_mac_addr_set(stableMac);
         }
+
+        WiFi.mode(WIFI_STA);
+        WiFi.setAutoReconnect(false);
+        // Force 20 MHz bandwidth — avoids auth failures on routers using
+        // non-standard HT40 secondary-channel configurations (ch=7, etc.)
+        esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
+
+        LOG_D("WEB", "STA MAC: %s", WiFi.macAddress().c_str());
+
+        // Capture disconnect reason for diagnostics
+        WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+            LOG_E("WEB", "WiFi disconnected: reason=%d",
+                  (int)info.wifi_sta_disconnected.reason);
+        }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+
+        // Scan: verify SSID is visible and capture BSSID+channel
+        LOG_D("WEB", "Scanning for SSID='%s' ...", g_config.staSsid);
+        int scanN = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/false,
+                                      /*passive=*/false, /*max_ms=*/400);
+        uint8_t targetBssid[6] = {};
+        int32_t targetChannel  = 0;
+        bool    targetFound    = false;
+
+        if (scanN <= 0) {
+            LOG_E("WEB", "Scan found %d networks", scanN);
+        } else {
+            for (int i = 0; i < scanN; i++) {
+                bool match = (strcmp(WiFi.SSID(i).c_str(), g_config.staSsid) == 0);
+                if (match && !targetFound) {
+                    targetChannel = WiFi.channel(i);
+                    memcpy(targetBssid, WiFi.BSSID(i), 6);
+                    targetFound = true;
+                LOG_I("WEB", "STA target found RSSI=%d ch=%d enc=%d",
+                    WiFi.RSSI(i), WiFi.channel(i), (int)WiFi.encryptionType(i));
+                }
+            }
+        }
+        WiFi.scanDelete();
+        delay(200);  // let radio settle fully after scan before connecting
+
+        // Low-level config: set authmode threshold to match AP's enc=3 (WPA2-PSK),
+        // enable PMF capable (but not required) to satisfy any MFP-capable APs,
+        // and lock to the scanned BSSID+channel for a clean targeted connection.
+        wifi_config_t wifi_cfg = {};
+        strncpy((char*)wifi_cfg.sta.ssid,     g_config.staSsid, sizeof(wifi_cfg.sta.ssid) - 1);
+        strncpy((char*)wifi_cfg.sta.password, g_config.staPass, sizeof(wifi_cfg.sta.password) - 1);
+        wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+        wifi_cfg.sta.pmf_cfg.capable    = true;
+        wifi_cfg.sta.pmf_cfg.required   = false;
+        if (targetFound) {
+            wifi_cfg.sta.channel   = (uint8_t)targetChannel;
+            wifi_cfg.sta.bssid_set = 1;
+            memcpy(wifi_cfg.sta.bssid, targetBssid, 6);
+        }
+        esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
+        esp_wifi_disconnect();  // clear any leftover auth state before connecting
+
+          LOG_I("WEB", "STA connecting SSID='%s' MAC=%s bssid_set=%d ch=%ld",
+            g_config.staSsid, WiFi.macAddress().c_str(),
+              (int)wifi_cfg.sta.bssid_set, targetChannel);
+        esp_wifi_connect();
+
+        // Wait up to 15 s for connection
+        uint32_t t0 = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
+            delay(500);
+            LOG_D("WEB", "  status=%d elapsed=%lus", (int)WiFi.status(), (millis()-t0)/1000);
+        }
+
+        if (WiFi.status() != WL_CONNECTED) {
+            LOG_E("WEB", "STA failed: status=%d", (int)WiFi.status());
+            WiFi.disconnect(true);
+            WiFi.mode(WIFI_OFF);
+            return;
+        }
+
+        esp_wifi_set_ps(WIFI_PS_NONE);
+        LOG_I("WEB", "STA connected: IP=%s", WiFi.localIP().toString().c_str());
+        LOG_D("WEB", "Free heap after WiFi start: %u", ESP.getFreeHeap());
+
+    } else {
+        // ── AP mode (default): create a soft access point ───────────────
+        WiFi.mode(WIFI_AP);
+        delay(100);  // let radio + netif settle
+
+        // Explicit params: channel 1, not hidden, max 4 clients
+        if (!WiFi.softAP(g_config.apSsid, g_config.apPass, 1, 0, 4)) {
+            LOG_E("WEB", "softAP() failed!");
+            WiFi.mode(WIFI_OFF);
+            return;
+        }
+
+        // Wait until the AP interface has a valid IP (DHCP server ready)
+        {
+            uint32_t t0 = millis();
+            while (WiFi.softAPIP() == IPAddress(0, 0, 0, 0) && millis() - t0 < 3000) {
+                delay(50);
+            }
+        }
+        if (WiFi.softAPIP() == IPAddress(0, 0, 0, 0)) {
+            LOG_E("WEB", "AP interface has no IP — aborting");
+            WiFi.softAPdisconnect(true);
+            WiFi.mode(WIFI_OFF);
+            return;
+        }
+
+        delay(200);  // let AP + DHCP stabilise before starting HTTP server
+
+        // BLE is NOT initialized yet (lazy init), so WIFI_PS_NONE is safe here.
+        // Disabling modem-sleep ensures beacons are sent on time and the SSID
+        // stays visible consistently. The coex scheduler will take over once
+        // ensureController() is called later.
+        esp_wifi_set_ps(WIFI_PS_NONE);
+
+        LOG_I("WEB", "AP started: SSID=%s IP=%s",
+              g_config.apSsid, WiFi.softAPIP().toString().c_str());
+        LOG_D("WEB", "Free heap after WiFi start: %u", ESP.getFreeHeap());
     }
-    if (WiFi.softAPIP() == IPAddress(0, 0, 0, 0)) {
-        LOG_E("WEB", "AP interface has no IP — aborting");
-        WiFi.softAPdisconnect(true);
-        WiFi.mode(WIFI_OFF);
-        return;
-    }
-
-    delay(200);  // let AP + DHCP stabilise before starting HTTP server
-
-    // BLE is NOT initialized yet (lazy init), so WIFI_PS_NONE is safe here.
-    // Disabling modem-sleep ensures beacons are sent on time and the SSID
-    // stays visible consistently. The coex scheduler will take over once
-    // ensureController() is called later.
-    esp_wifi_set_ps(WIFI_PS_NONE);
-
-    LOG_I("WEB", "AP started: SSID=%s IP=%s",
-          g_config.apSsid, WiFi.softAPIP().toString().c_str());
-    LOG_D("WEB", "Free heap after WiFi start: %u", ESP.getFreeHeap());
 
     // Register WebSocket handler and routes only once
     if (!s_wsAdded) {
@@ -892,7 +1234,7 @@ void webUiInit() {
             handleOtaUpload
         );
 
-        // Captive portal detection endpoints — redirect to main page
+        // Captive portal detection endpoints — redirect to main page (AP mode only)
         // Android
         s_server.on("/generate_204", HTTP_GET, [](AsyncWebServerRequest* r) {
             r->redirect("http://" + WiFi.softAPIP().toString() + "/");
@@ -918,7 +1260,10 @@ void webUiInit() {
 
         // Catch-all: any unknown URL redirects to the config page
         s_server.onNotFound([](AsyncWebServerRequest* r) {
-            r->redirect("http://" + WiFi.softAPIP().toString() + "/");
+            String ip = (g_config.wifiMode == WifiMode::STA)
+                        ? WiFi.localIP().toString()
+                        : WiFi.softAPIP().toString();
+            r->redirect("http://" + ip + "/");
         });
 
         s_wsAdded = true;
@@ -942,8 +1287,12 @@ void webUiStop() {
     // Stop HTTP server
     s_server.end();
 
-    // Disconnect WiFi AP
-    WiFi.softAPdisconnect(true);
+    // Disconnect WiFi — AP or STA
+    if (g_config.wifiMode == WifiMode::STA) {
+        WiFi.disconnect(true);
+    } else {
+        WiFi.softAPdisconnect(true);
+    }
     delay(50);
     WiFi.mode(WIFI_OFF);
     delay(50);
@@ -961,13 +1310,17 @@ void webUiLoop() {
     // the "OK" body and show the "Rebooting…" message.
     if (s_otaPendingRestart) {
         delay(1500);
-        // After OTA, keep the WiFi AP up so the browser can reconnect.
-        // For LUA Serial + WiFi UDP: use TELEM_AP — WiFi AP stays up AND
-        // the Lua script is not blocked (no orange overlay on the radio).
-        // All other configurations: use regular AP_MODE.
-        bool luaWifi = (g_config.serialMode == OutputMode::LUA_SERIAL &&
-                        g_config.telemetryOutput == TelemetryOutput::WIFI_UDP);
-        uint8_t nextMode = luaWifi ? 2 : 1;  // BOOT_TELEM_AP : BOOT_AP_MODE
+        // After OTA, return to the WiFi mode that is currently active at runtime
+        // (not just the configured one), so boot override modes are preserved.
+        // STA active -> BOOT_STA_MODE (3), otherwise AP/TELEM_AP path.
+        uint8_t nextMode = 1;  // BOOT_AP_MODE default
+        wifi_mode_t wm = WiFi.getMode();
+        if (wm == WIFI_STA || wm == WIFI_AP_STA) {
+          nextMode = 3;  // BOOT_STA_MODE
+        } else if (g_config.serialMode == OutputMode::LUA_SERIAL &&
+               g_config.telemetryOutput == TelemetryOutput::WIFI_UDP) {
+          nextMode = 2;  // BOOT_TELEM_AP
+        }
         Preferences prefs;
         prefs.begin("btwboot", false);
         prefs.putUChar("mode", nextMode);
@@ -986,7 +1339,8 @@ void webUiLoop() {
     // Proactive status push every 3 s — keeps the TCP connection alive
     // under WiFi/BLE coexistence and avoids relying solely on client polling.
     static uint32_t lastPush = 0;
-    if (s_ws.count() > 0 && millis() - lastPush >= 3000) {
+    uint32_t pushIntervalMs = bleIsConnecting() ? 8000 : 3000;
+    if (s_ws.count() > 0 && millis() - lastPush >= pushIntervalMs) {
         lastPush = millis();
 
         JsonDocument doc;
@@ -1004,6 +1358,9 @@ void webUiLoop() {
         doc["serialMode"] = mStr;
         doc["btName"]     = g_config.btName;
         doc["apSsid"]     = g_config.apSsid;
+        doc["apPass"]     = g_config.apPass;
+        doc["staSsid"]    = g_config.staSsid;
+        doc["staPass"]    = g_config.staPass;
         doc["buildTs"]    = BUILD_TIMESTAMP;
 
         const char* lAddr = bleGetLocalAddress();
@@ -1028,6 +1385,15 @@ void webUiLoop() {
         doc["udpPort"]     = String(g_config.udpPort);
         doc["sportPkts"]   = String(sportGetPacketCount());
         doc["sportPps"]    = String(sportGetPacketsPerSec());
+        doc["mapMode"]     = g_config.trainerMapMode == TrainerMapMode::MAP_TR ? "tr" : "gv";
+
+        // WiFi mode: report actual running mode, same logic as getStatus
+        {
+            wifi_mode_t wm = WiFi.getMode();
+            if      (wm == WIFI_AP || wm == WIFI_AP_STA) doc["wifiMode"] = "ap";
+            else if (wm == WIFI_STA)                     doc["wifiMode"] = "sta";
+            else                                          doc["wifiMode"] = "off";
+        }
 
         String out;
         serializeJson(doc, out);

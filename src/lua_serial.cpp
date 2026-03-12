@@ -1,11 +1,10 @@
 /**
  * @file lua_serial.cpp
- * @brief EdgeTX LUA Serial mode — bidirectional channel + command protocol
+ * @brief EdgeTX LUA Serial — multi-channel binary protocol implementation.
  *
  * See lua_serial.h for full protocol documentation.
  *
- * UART configuration: 115200 baud, 8N1, no inversion (standard UART).
- * EdgeTX AUX port must be configured as "LUA" at 115200 baud.
+ * UART: 115200 baud, 8N1, UART1 (GPIO21 TX / GPIO20 RX).
  */
 
 #include "lua_serial.h"
@@ -13,634 +12,755 @@
 #include "channel_data.h"
 #include "ble_module.h"
 #include "sport_telemetry.h"
+#include "build_ts_gen.h"
 #include "log.h"
 
 #include <Arduino.h>
 #include <Preferences.h>
 #include <WiFi.h>
 #include <driver/uart.h>
+#include <algorithm>
 
-// ─── Protocol constants ─────────────────────────────────────────────
-static constexpr uint8_t  LUA_SYNC        = 0xAA;
-static constexpr uint8_t  LUA_TYPE_CH     = 0x43;  // 'C' — channel frame
-static constexpr uint8_t  LUA_TYPE_STATUS = 0x53;  // 'S' — status frame
-static constexpr uint8_t  LUA_TYPE_ACK    = 0x41;  // 'A' — ACK frame (response to commands)
-static constexpr uint8_t  LUA_TYPE_CFG    = 0x47;  // 'G' — config push frame (ESP32 → Lua)
-static constexpr uint8_t  LUA_TYPE_INF    = 0x49;  // 'I' — info frame: 12-byte build timestamp
-static constexpr uint8_t  LUA_TYPE_SYS    = 0x59;  // 'Y' — system info frame (ESP32 → Lua)
-static constexpr uint8_t  LUA_TYPE_SCAN_STATUS = 0x44;  // 'D' — scan state notification
-static constexpr uint8_t  LUA_TYPE_SCAN_ENTRY  = 0x52;  // 'R' — scan result entry
-static constexpr uint8_t  LUA_TYPE_CMD    = 0x02;  // command frame (incoming)
-static constexpr uint8_t  LUA_TYPE_STR_SET = 0x4E; // 'N' — string set frame (incoming: subCmd + 16 data bytes)
-static constexpr uint8_t  STR_SUB_BT_NAME  = 0x01; // subcommand: set BT name
-static constexpr uint8_t  STR_SUB_SSID     = 0x02; // subcommand: set AP SSID
-static constexpr uint8_t  STR_SUB_UDP_PORT = 0x03; // subcommand: set UDP port
-static constexpr uint8_t  STR_SUB_AP_PASS  = 0x04; // subcommand: set AP password
-static constexpr uint8_t  LUA_CMD_BAUD_57600     = 0x0F; // set mirror baud → 57600
-static constexpr uint8_t  LUA_CMD_BAUD_115200    = 0x23; // set mirror baud → 115200
-static constexpr uint8_t  LUA_CMD_MAP_GV         = 0x24; // set trainer map mode → GV (global vars)
-static constexpr uint8_t  LUA_CMD_MAP_TR         = 0x25; // set trainer map mode → TR (trainer channels)
-static constexpr uint8_t  LUA_CMD_TOGGLE_AP     = 0x01;
-static constexpr uint8_t  LUA_CMD_AP_ON          = 0x02;
-static constexpr uint8_t  LUA_CMD_AP_OFF         = 0x03;
-static constexpr uint8_t  LUA_CMD_DEV_TRAINER_IN  = 0x20;  // set device mode → Trainer IN
-static constexpr uint8_t  LUA_CMD_DEV_TRAINER_OUT = 0x21;  // set device mode → Trainer OUT
-static constexpr uint8_t  LUA_CMD_DEV_TELEMETRY   = 0x22;  // set device mode → Telemetry
-static constexpr uint8_t  LUA_CMD_REQUEST_INFO   = 0x06;  // Lua requests CFG+INF immediately
-static constexpr uint8_t  LUA_CMD_BLE_SCAN       = 0x07;  // start BLE scan (Central mode)
-static constexpr uint8_t  LUA_CMD_HEARTBEAT       = 0x08;  // Tools-active heartbeat (no-op, updates idle timer)
-static constexpr uint8_t  LUA_CMD_BLE_DISCONNECT  = 0x09;  // disconnect BLE (keep saved addr)
-static constexpr uint8_t  LUA_CMD_BLE_FORGET      = 0x0A;  // forget saved BLE device
-static constexpr uint8_t  LUA_CMD_BLE_RECONNECT   = 0x0B;  // reconnect to saved BLE device
-static constexpr uint8_t  LUA_CMD_BLE_CONNECT_0   = 0x10;  // 0x10..0x1F = connect scan[0..15]
-static constexpr uint8_t  LUA_CMD_TELEM_WIFI       = 0x0C;  // set telemetry output → WiFi UDP (save+restart)
-static constexpr uint8_t  LUA_CMD_TELEM_BLE        = 0x0D;  // set telemetry output → BLE (save+restart)
-static constexpr uint8_t  LUA_CMD_TELEM_OFF        = 0x0E;  // set telemetry output → None/Off (save+restart)
-static constexpr uint8_t  LUA_TYPE_TLM            = 0x54;  // 'T' — telemetry forward frame (Radio → ESP32)
-
-static constexpr uint32_t LUA_BAUD             = 115200;
-static constexpr uint32_t CH_FRAME_INTERVAL    = 10;     // ms (~100 Hz)
-static constexpr uint32_t STATUS_INTERVAL      = 500;    // ms
-static constexpr uint32_t CFG_INTERVAL         = 30000;  // ms — periodic resync
-static constexpr uint32_t TOOLS_IDLE_TIMEOUT   = 15000;  // ms — stop heavy TX if no CMD received
-
-// Channel frame: sync(1) + type(1) + 8×2 bytes channels(16) + CRC(1) = 19 bytes
-static constexpr uint8_t  CH_FRAME_LEN = 19;
-// Status frame: sync(1) + type(1) + status(1) + CRC(1) = 4 bytes
-static constexpr uint8_t  ST_FRAME_LEN = 4;
-// ACK frame: sync(1) + type(1) + result(1) + CRC(1) = 4 bytes
-static constexpr uint8_t  ACK_FRAME_LEN = 4;
-// Config frame: sync(1) + type(1) + apMode(1) + deviceMode(1) + tlmOutput(1) + mapMode(1) + CRC(1) = 7 bytes
-static constexpr uint8_t  CFG_FRAME_LEN = 7;
-// Info frame: sync(1) + type(1) + 12 ASCII timestamp bytes + CRC(1) = 15 bytes
-static constexpr uint8_t  INF_PAYLOAD_LEN = 12;
-static constexpr uint8_t  INF_FRAME_LEN   = 15;
-// Sys frame: sync(1)+type(1)+serialMode(1)+btName(16)+localAddr(18)+remoteAddr(18)+apSsid(16)+udpPort(2)+apPass(16)+baudIdx(1)+CRC(1)=91
-static constexpr uint8_t  SYS_FRAME_LEN   = 91;
-// Rx command frame: sync(1) + type(1) + cmd(1) + CRC(1) = 4 bytes
-static constexpr uint8_t  CMD_FRAME_LEN = 4;
-// Scan status: sync(1)+type(1)+state(1)+count(1)+CRC(1) = 5
-static constexpr uint8_t  SCAN_STATUS_FRAME_LEN = 5;
-// Scan entry: sync(1)+type(1)+idx(1)+rssi(1)+hasFrsky(1)+name(16)+addr(18)+CRC(1) = 40
-static constexpr uint8_t  SCAN_ENTRY_FRAME_LEN  = 40;
-// TLM frame (Radio → ESP32): sync(1)+type(1)+8-byte SportPacket+CRC(1) = 12 bytes
-static constexpr uint8_t  TLM_FRAME_PAYLOAD_LEN = 9;   // type(1) + SportPacket(8), CRC follows
-
-// ─── Module state ───────────────────────────────────────────────────
-static bool     s_running       = false;
-static uint8_t  s_apMode        = 0;  // 0=normal, 1=AP-block (Lua overlay), 2=telemetry-AP (no block)
-static uint32_t s_lastChMs      = 0;
-static uint32_t s_lastStatusMs  = 0;
-static uint32_t s_lastCfgMs     = 0;
-static uint32_t s_lastToolsCmdMs = 0; // millis() of last CMD/STR_SET from Tools script
+// ── Module state ────────────────────────────────────────────────────
+static bool     s_running          = false;
+static uint8_t  s_apMode           = 0;    // 0=normal, 1=AP-block, 2=telemetry-AP, 3=STA
+static uint32_t s_lastChMs         = 0;
+static uint32_t s_lastStatusMs     = 0;
+static uint32_t s_lastCfgMs        = 0;
+static uint32_t s_lastToolsCmdMs   = 0;
+static bool     s_lastBleConnected = false;
 
 // BLE scan drip-feed state
-static bool                s_scanWasActive   = false;
-static bool                s_scanSending     = false;
-static uint8_t             s_scanSendIdx     = 0;
-static uint8_t             s_scanSendTotal   = 0;
-static uint32_t            s_lastScanEntryMs = 0;
-static BleScanResult       s_scanCache[MAX_SCAN_RESULTS];
-// BLE connection change detection
-static bool                s_lastBleConnected = false;
+static bool          s_scanWasActive   = false;
+static bool          s_scanSending     = false;
+static uint8_t       s_scanSendIdx     = 0;
+static uint8_t       s_scanSendTotal   = 0;
+static uint32_t      s_lastScanEntryMs = 0;
+static BleScanResult s_scanCache[MAX_SCAN_RESULTS];
 
-// RX state machine
-static uint8_t  s_rxState  = 0;   // 0=wait sync, 1=got sync, 2=accumulating
+// WiFi scan task state
+static volatile bool    s_wifiScanDone    = false;
+static volatile int16_t s_wifiScanCount   = 0;
+static bool             s_wifiScanActive  = false;  // true: task running or drip-feed in progress
+static bool             s_wifiScanSending = false;
+static uint8_t          s_wifiScanSendIdx = 0;
+static uint32_t         s_lastWifiScanMs  = 0;
+
+// Telemetry output tracking
+static bool s_tlmOutputActive = false;
+
+// ── RX state machine ────────────────────────────────────────────────
+// States: 0=wait-sync 1=ch 2=type 3=len 4=accumulate 5=crc
+static uint8_t  s_rxState  = 0;
+static uint8_t  s_rxCh     = 0;
 static uint8_t  s_rxType   = 0;
-static uint8_t  s_rxBuf[20];      // max incoming: T_STR_SET = type(1)+subCmd(1)+data(16)+CRC(1) = 19
+static uint8_t  s_rxLen    = 0;
+static uint8_t  s_rxBuf[48];   // max incoming payload (PREF_SET STRING: 1+1+1+15+padding)
 static uint8_t  s_rxPos    = 0;
-static uint8_t  s_rxNeeded = 0;
+static uint8_t  s_rxCrcAcc = 0;
 
-// Telemetry output (Lua proxy) state
-static bool     s_tlmOutputActive = false;
-
-// ─── Functions in main.cpp ──────────────────────────────────────────
-// ─── Functions in main.cpp ──────────────────────────────────────────────
+// ── Functions in main.cpp ────────────────────────────────────────────
 extern void mainRequestApMode();
 extern void mainRequestNormalMode();
 extern void mainSetDeviceMode(uint8_t mode);
-extern void mainSetTelemOutput(uint8_t output);  // save telemetryOutput config + restart into appropriate boot mode
-extern void mainSetMirrorBaud(uint32_t baud);    // save sportBaud config + restart
+extern void mainSetTelemOutput(uint8_t output);
+extern void mainSetMirrorBaud(uint32_t baud);
+extern void mainSetWifiMode(uint8_t mode);
+// ── Generic frame sender ─────────────────────────────────────────────
+// Builds and sends: [SYNC][CH][TYPE][LEN][payload...][CRC]
+// CRC = XOR(CH ^ TYPE ^ LEN ^ payload[0..len-1])
 
-// ─── T_TLM handler ─────────────────────────────────────────────────────
-
-/**
- * @brief Process a validated T_TLM frame: parse SportPacket and forward to output.
- *
- * s_rxBuf layout after accumulation:
- *   [0] = TYPE (0x54)
- *   [1] = physId
- *   [2] = primId
- *   [3] = dataId_lo
- *   [4] = dataId_hi
- *   [5..8] = value (little-endian uint32)
- *   [9] = XOR_CRC  (XOR of s_rxBuf[0..8])
- */
-static void handleTlmFrame() {
-    // Verify XOR CRC over bytes [0..8]
-    uint8_t crc = 0;
-    for (uint8_t i = 0; i < 9; i++) crc ^= s_rxBuf[i];
-    if (crc != s_rxBuf[9]) {
-        LOG_W("LUA", "T_TLM CRC error: calc=0x%02X got=0x%02X", crc, s_rxBuf[9]);
-        return;
+static void sendFrame(uint8_t ch, uint8_t typ, const uint8_t* payload, uint8_t len) {
+    // Max frame = 5 overhead + 255 payload = 260 bytes (payload limited to 48 here)
+    uint8_t buf[260];
+    buf[0] = LUA_SYNC;
+    buf[1] = ch;
+    buf[2] = typ;
+    buf[3] = len;
+    uint8_t crc = ch ^ typ ^ len;
+    for (uint8_t i = 0; i < len; i++) {
+        buf[4 + i] = payload[i];
+        crc ^= payload[i];
     }
-
-    // NONE mode: discard packet silently (no output configured)
-    if (g_config.telemetryOutput == TelemetryOutput::NONE) return;
-
-    // Init output on first arriving packet
-    if (!s_tlmOutputActive) {
-        sportOutputInit();
-        s_tlmOutputActive = true;
-    }
-
-    SportPacket pkt;
-    pkt.physId = s_rxBuf[1];
-    pkt.primId = s_rxBuf[2];
-    pkt.dataId = s_rxBuf[3] | ((uint16_t)s_rxBuf[4] << 8);
-    pkt.value  = s_rxBuf[5] | ((uint32_t)s_rxBuf[6] << 8) |
-                 ((uint32_t)s_rxBuf[7] << 16) | ((uint32_t)s_rxBuf[8] << 24);
-
-    sportOutputForwardPacket(&pkt);
+    buf[4 + len] = crc;
+    uart_write_bytes(UART_NUM_1, (const char*)buf, (size_t)(5 + len));
 }
 
-// ─── Helpers ────────────────────────────────────────────────────────
+// ── Helpers for PREF_ITEM / PREF_UPDATE payload building ─────────────
 
-/**
- * @brief Convert a HeadTracker PPM channel value to a signed trainer int16.
- *
- * Input:  1050 (-100%) … 1500 (centre) … 1950 (+100%)
- * Output: -1024        …    0          …  +1024
- */
+// Convert the current s_apMode → WiFi Mode enum index seen by Lua
+// 0=normal → 0 ("Off"),  1=AP-block or 2=telem-AP → 1 ("AP"),  3=STA → 2 ("STA")
+static inline uint8_t wifiModeIdx() {
+    if (s_apMode == 3) return 2;  // STA
+    return (s_apMode == 0) ? 0 : 1;  // Off / AP
+}
+
+// Append a length-prefixed string to a buffer. Returns new pos.
+static uint8_t appendLenStr(uint8_t* buf, uint8_t pos, const char* str) {
+    uint8_t n = (uint8_t)strlen(str);
+    buf[pos++] = n;
+    memcpy(&buf[pos], str, n);
+    return pos + n;
+}
+
+// ── PREF channel senders ─────────────────────────────────────────────
+
+static void sendPrefBegin(uint8_t count) {
+    sendFrame(LUA_CH_PREF, LUA_PT_PREF_BEGIN, &count, 1);
+}
+
+static void sendPrefEnd() {
+    sendFrame(LUA_CH_PREF, LUA_PT_PREF_END, nullptr, 0);
+}
+
+static void sendPrefItem(uint8_t id) {
+    uint8_t buf[128];
+    uint8_t pos = 0;
+
+    buf[pos++] = id;
+
+    const char* label = nullptr;
+    uint8_t ftype = LUA_FT_ENUM;
+    uint8_t flags = 0;
+
+    switch (id) {
+        case LUA_PREF_WIFI_MODE:    label = "WiFi Mode";     ftype = LUA_FT_ENUM;   flags = LUA_PF_RESTART | LUA_PF_DASHBOARD; break;
+        case LUA_PREF_DEV_MODE:    label = "Device Mode";   ftype = LUA_FT_ENUM;   flags = LUA_PF_RESTART | LUA_PF_DASHBOARD; break;
+        case LUA_PREF_TELEM_OUT:   label = "Telem Out";     ftype = LUA_FT_ENUM;   flags = LUA_PF_RESTART | LUA_PF_DASHBOARD; break;
+        case LUA_PREF_MIRROR_BAUD: label = "Mirror Baud";   ftype = LUA_FT_ENUM;   flags = LUA_PF_RESTART;                    break;
+        case LUA_PREF_MAP_MODE:    label = "Trainer Map";   ftype = LUA_FT_ENUM;   flags = 0;                                 break;
+        case LUA_PREF_BT_NAME:     label = "BT Name";       ftype = LUA_FT_STRING; flags = LUA_PF_DASHBOARD;                  break;
+        case LUA_PREF_AP_SSID:     label = "AP SSID";       ftype = LUA_FT_STRING; flags = LUA_PF_RESTART;                    break;
+        case LUA_PREF_UDP_PORT:    label = "UDP Port";       ftype = LUA_FT_STRING; flags = LUA_PF_RESTART | LUA_PF_NUMERIC;   break;
+        case LUA_PREF_AP_PASS:     label = "AP Password";   ftype = LUA_FT_STRING; flags = LUA_PF_RESTART;                    break;
+        case LUA_PREF_STA_SSID:    label = "STA SSID";      ftype = LUA_FT_STRING; flags = 0;                                  break;
+        case LUA_PREF_STA_PASS:    label = "STA Password";  ftype = LUA_FT_STRING; flags = LUA_PF_RESTART;                    break;
+        default: return;
+    }
+
+    buf[pos++] = ftype;
+    buf[pos++] = flags;
+    pos = appendLenStr(buf, pos, label);
+
+    // Type-specific payload
+    switch (id) {
+        case LUA_PREF_WIFI_MODE: {
+            static const char* opts[] = { "Off", "AP", "STA" };
+            buf[pos++] = 3;
+            buf[pos++] = wifiModeIdx();
+            for (int i = 0; i < 3; i++) pos = appendLenStr(buf, pos, opts[i]);
+            break;
+        }
+        case LUA_PREF_DEV_MODE: {
+            static const char* opts[] = { "Trainer IN", "Trainer OUT", "Telemetry" };
+            buf[pos++] = 3;
+            buf[pos++] = (uint8_t)g_config.deviceMode;
+            for (int i = 0; i < 3; i++) pos = appendLenStr(buf, pos, opts[i]);
+            break;
+        }
+        case LUA_PREF_TELEM_OUT: {
+            static const char* opts[] = { "WiFi UDP", "BLE", "Off" };
+            buf[pos++] = 3;
+            buf[pos++] = (uint8_t)g_config.telemetryOutput;
+            for (int i = 0; i < 3; i++) pos = appendLenStr(buf, pos, opts[i]);
+            break;
+        }
+        case LUA_PREF_MIRROR_BAUD: {
+            static const char* opts[] = { "57600", "115200" };
+            buf[pos++] = 2;
+            buf[pos++] = (g_config.sportBaud == 115200) ? 1 : 0;
+            for (int i = 0; i < 2; i++) pos = appendLenStr(buf, pos, opts[i]);
+            break;
+        }
+        case LUA_PREF_MAP_MODE: {
+            static const char* opts[] = { "GV", "TR" };
+            buf[pos++] = 2;
+            buf[pos++] = (uint8_t)g_config.trainerMapMode;
+            for (int i = 0; i < 2; i++) pos = appendLenStr(buf, pos, opts[i]);
+            break;
+        }
+        case LUA_PREF_BT_NAME: {
+            buf[pos++] = 15;   // maxLen
+            pos = appendLenStr(buf, pos, g_config.btName);
+            break;
+        }
+        case LUA_PREF_AP_SSID: {
+            buf[pos++] = 15;
+            pos = appendLenStr(buf, pos, g_config.apSsid);
+            break;
+        }
+        case LUA_PREF_UDP_PORT: {
+            char portStr[6];
+            snprintf(portStr, sizeof(portStr), "%u", g_config.udpPort);
+            buf[pos++] = 5;    // maxLen (5 digits)
+            pos = appendLenStr(buf, pos, portStr);
+            break;
+        }
+        case LUA_PREF_AP_PASS: {
+            buf[pos++] = 15;
+            pos = appendLenStr(buf, pos, g_config.apPass);
+            break;
+        }
+        case LUA_PREF_STA_SSID: {
+            buf[pos++] = 31;
+            pos = appendLenStr(buf, pos, g_config.staSsid);
+            break;
+        }
+        case LUA_PREF_STA_PASS: {
+            buf[pos++] = 63;
+            pos = appendLenStr(buf, pos, g_config.staPass);
+            break;
+        }
+    }
+
+    sendFrame(LUA_CH_PREF, LUA_PT_PREF_ITEM, buf, pos);
+}
+
+static void sendPrefAll() {
+    static const uint8_t ids[] = {
+        LUA_PREF_WIFI_MODE, LUA_PREF_DEV_MODE, LUA_PREF_TELEM_OUT,
+        LUA_PREF_MIRROR_BAUD, LUA_PREF_MAP_MODE,
+        LUA_PREF_BT_NAME, LUA_PREF_AP_SSID, LUA_PREF_UDP_PORT, LUA_PREF_AP_PASS,
+        LUA_PREF_STA_SSID, LUA_PREF_STA_PASS
+    };
+    sendPrefBegin(LUA_PREF_COUNT);
+    for (uint8_t id : ids) sendPrefItem(id);
+    sendPrefEnd();
+}
+
+// Send value-only update for one pref (after cascade or MAP_MODE save).
+static void sendPrefUpdate(uint8_t id) {
+    uint8_t buf[32];
+    uint8_t pos = 0;
+    buf[pos++] = id;
+
+    switch (id) {
+        case LUA_PREF_WIFI_MODE:
+            buf[pos++] = LUA_FT_ENUM;
+            buf[pos++] = wifiModeIdx();
+            break;
+        case LUA_PREF_DEV_MODE:
+            buf[pos++] = LUA_FT_ENUM;
+            buf[pos++] = (uint8_t)g_config.deviceMode;
+            break;
+        case LUA_PREF_TELEM_OUT:
+            buf[pos++] = LUA_FT_ENUM;
+            buf[pos++] = (uint8_t)g_config.telemetryOutput;
+            break;
+        case LUA_PREF_MIRROR_BAUD:
+            buf[pos++] = LUA_FT_ENUM;
+            buf[pos++] = (g_config.sportBaud == 115200) ? 1 : 0;
+            break;
+        case LUA_PREF_MAP_MODE:
+            buf[pos++] = LUA_FT_ENUM;
+            buf[pos++] = (uint8_t)g_config.trainerMapMode;
+            break;
+        case LUA_PREF_BT_NAME:
+            buf[pos++] = LUA_FT_STRING;
+            pos = appendLenStr(buf, pos, g_config.btName);
+            break;
+        default:
+            return;
+    }
+
+    sendFrame(LUA_CH_PREF, LUA_PT_PREF_UPDATE, buf, pos);
+}
+
+// Send ACK and flush (so Lua receives it before any restart).
+static void sendPrefAck(uint8_t id, uint8_t result) {
+    uint8_t p[2] = { id, result };
+    sendFrame(LUA_CH_PREF, LUA_PT_PREF_ACK, p, 2);
+    uart_wait_tx_done(UART_NUM_1, pdMS_TO_TICKS(50));
+}
+
+// ── INFO channel senders ─────────────────────────────────────────────
+
+static void sendInfoBegin(uint8_t count) {
+    sendFrame(LUA_CH_INFO, LUA_PT_INFO_BEGIN, &count, 1);
+}
+
+static void sendInfoEnd() {
+    sendFrame(LUA_CH_INFO, LUA_PT_INFO_END, nullptr, 0);
+}
+
+static void sendInfoItem(uint8_t id) {
+    uint8_t buf[48];
+    uint8_t pos = 0;
+    buf[pos++] = id;
+    buf[pos++] = LUA_FT_STRING;   // all info items are strings
+
+    const char* label = nullptr;
+    char val[32] = {};
+
+    switch (id) {
+        case LUA_INFO_FIRMWARE: {
+            label = "Firmware";
+            // BUILD_TIMESTAMP is "DDMMYYYYHHMM" (12 chars).  Display as "DDMMYYYY HHMM".
+            snprintf(val, sizeof(val), "%.8s %.4s",
+                     BUILD_TIMESTAMP, BUILD_TIMESTAMP + 8);
+            break;
+        }
+        case LUA_INFO_BT_ADDR: {
+            label = "BT Addr";
+            const char* addr = bleGetLocalAddress();
+            strlcpy(val, addr ? addr : "?", sizeof(val));
+            break;
+        }
+        case LUA_INFO_REM_ADDR: {
+            label = "Remote Addr";
+            strlcpy(val, g_config.hasRemoteAddr ? g_config.remoteBtAddr : "(none)",
+                    sizeof(val));
+            break;
+        }
+        default: return;
+    }
+
+    pos = appendLenStr(buf, pos, label);
+    pos = appendLenStr(buf, pos, val);
+    sendFrame(LUA_CH_INFO, LUA_PT_INFO_ITEM, buf, pos);
+}
+
+static void sendInfoAll() {
+    sendInfoBegin(LUA_INFO_COUNT);
+    for (uint8_t id = LUA_INFO_FIRMWARE; id <= LUA_INFO_REM_ADDR; id++) {
+        sendInfoItem(id);
+    }
+    sendInfoEnd();
+}
+
+// Send value-only update for one info field.
+static void sendInfoUpdate(uint8_t id) {
+    uint8_t buf[32];
+    uint8_t pos = 0;
+    buf[pos++] = id;
+    buf[pos++] = LUA_FT_STRING;
+
+    char val[32] = {};
+    switch (id) {
+        case LUA_INFO_FIRMWARE:
+            snprintf(val, sizeof(val), "%.8s %.4s",
+                     BUILD_TIMESTAMP, BUILD_TIMESTAMP + 8);
+            break;
+        case LUA_INFO_BT_ADDR: {
+            const char* addr = bleGetLocalAddress();
+            strlcpy(val, addr ? addr : "?", sizeof(val));
+            break;
+        }
+        case LUA_INFO_REM_ADDR:
+            strlcpy(val, g_config.hasRemoteAddr ? g_config.remoteBtAddr : "(none)",
+                    sizeof(val));
+            break;
+        default: return;
+    }
+
+    pos = appendLenStr(buf, pos, val);
+    sendFrame(LUA_CH_INFO, LUA_PT_INFO_UPDATE, buf, pos);
+}
+
+// ── Periodic TX senders ───────────────────────────────────────────────
+
+// Convert PPM (1050–1950 µs) to signed trainer int16 (-1024..+1024).
 static inline int16_t ppmToTrainer(uint16_t ppm) {
-    // (ppm - 1500) * 1024 / 450
     int32_t v = ((int32_t)(ppm - CHANNEL_CENTER) * 1024) / (CHANNEL_RANGE / 2);
     if (v < -1024) v = -1024;
     if (v >  1024) v =  1024;
     return (int16_t)v;
 }
 
-// ─── Frame builders ─────────────────────────────────────────────────
-
-/**
- * @brief Send a channel frame (19 bytes) for all 8 channels.
- */
 static void sendChannelFrame() {
     uint16_t raw[BT_CHANNELS];
     g_channelData.getChannels(raw, BT_CHANNELS);
 
-    uint8_t frame[CH_FRAME_LEN];
-    frame[0] = LUA_SYNC;
-    frame[1] = LUA_TYPE_CH;
-
-    uint8_t crc = LUA_TYPE_CH;
-    for (uint8_t ch = 0; ch < BT_CHANNELS; ch++) {
+    uint8_t payload[16];
+    for (uint8_t ch = 0; ch < 8; ch++) {
         int16_t val = ppmToTrainer(raw[ch]);
-        uint8_t hi = (uint8_t)((val >> 8) & 0xFF);
-        uint8_t lo = (uint8_t)(val & 0xFF);
-        frame[2 + ch * 2]     = hi;
-        frame[2 + ch * 2 + 1] = lo;
-        crc ^= hi;
-        crc ^= lo;
+        payload[ch * 2]     = (uint8_t)((val >> 8) & 0xFF);
+        payload[ch * 2 + 1] = (uint8_t)(val & 0xFF);
     }
-    frame[CH_FRAME_LEN - 1] = crc;
-
-    uart_write_bytes(UART_NUM_1, (const char*)frame, CH_FRAME_LEN);
+    sendFrame(LUA_CH_INFO, LUA_PT_INFO_CHANNELS, payload, 16);
 }
 
-/**
- * @brief Send a status frame (4 bytes).
- *
- * STATUS bit0 = BLE connected  (1 = connected)
- * STATUS bit1 = AP has clients  (1 = ≥1 STA connected)
- * STATUS bit2 = BLE connecting  (1 = connection attempt in progress)
- */
 static void sendStatusFrame() {
-    uint8_t status = (bleIsConnected() ? 0x01 : 0x00)
-                   | (WiFi.softAPgetStationNum() > 0 ? 0x02 : 0x00)
+    // bit0 = BLE connected,  bit1 = WiFi active (AP running OR STA connected),
+    // bit2 = BLE connecting
+    uint8_t wifiActive = 0;
+    if (s_apMode == 1 || s_apMode == 2) {
+        wifiActive = 0x02;  // AP is up whenever we're in AP mode
+    } else if (s_apMode == 3) {
+        wifiActive = WiFi.isConnected() ? 0x02 : 0x00;
+    }
+    uint8_t status = (bleIsConnected()  ? 0x01 : 0x00)
+                   | wifiActive
                    | (bleIsConnecting() ? 0x04 : 0x00);
-    uint8_t crc    = LUA_TYPE_STATUS ^ status;
-
-    uint8_t frame[ST_FRAME_LEN] = {LUA_SYNC, LUA_TYPE_STATUS, status, crc};
-    uart_write_bytes(UART_NUM_1, (const char*)frame, ST_FRAME_LEN);
+    sendFrame(LUA_CH_INFO, LUA_PT_INFO_STATUS, &status, 1);
 }
 
-/**
- * @brief Send an info frame (15 bytes) with the 12-digit build timestamp (DDMMYYYYHHMM).
- */
-static void sendInfoFrame() {
-    uint8_t frame[INF_FRAME_LEN];
-    frame[0] = LUA_SYNC;
-    frame[1] = LUA_TYPE_INF;
-    uint8_t crc = LUA_TYPE_INF;
-    for (uint8_t i = 0; i < INF_PAYLOAD_LEN; i++) {
-        uint8_t b = (uint8_t)BUILD_TIMESTAMP[i];
-        frame[2 + i] = b;
-        crc ^= b;
-    }
-    frame[INF_FRAME_LEN - 1] = crc;
-    uart_write_bytes(UART_NUM_1, (const char*)frame, INF_FRAME_LEN);
-}
-
-/**
- * @brief Send a config push frame (6 bytes) with current AP mode, BLE role, and telemetry output.
- *
- * apMode byte semantics (Lua side):
- *   0 = AP active, Lua input blocked (regular AP/web-config mode)
- *   1 = normal operation (BLE active, no AP)
- *   2 = telemetry AP (WiFi AP active but Lua continues normally)
- */
-static void sendConfigFrame() {
-    // Map internal s_apMode → protocol byte
-    uint8_t apByte = (s_apMode == 1) ? 0 :   // AP-block  → 0
-                     (s_apMode == 2) ? 2 : 1; // telem-AP  → 2; normal → 1
-    uint8_t dev  = static_cast<uint8_t>(g_config.deviceMode);
-    uint8_t tout = static_cast<uint8_t>(g_config.telemetryOutput);
-    uint8_t mmap = static_cast<uint8_t>(g_config.trainerMapMode);
-    uint8_t crc  = LUA_TYPE_CFG ^ apByte ^ dev ^ tout ^ mmap;
-    uint8_t frame[CFG_FRAME_LEN] = {LUA_SYNC, LUA_TYPE_CFG, apByte, dev, tout, mmap, crc};
-    uart_write_bytes(UART_NUM_1, (const char*)frame, CFG_FRAME_LEN);
-}
-
-/**
- * @brief Send a system info frame (72 bytes): serialMode, btName, localAddr, remoteAddr, apSsid.
- */
-static void sendSysFrame() {
-    uint8_t frame[SYS_FRAME_LEN];
-    frame[0] = LUA_SYNC;
-    frame[1] = LUA_TYPE_SYS;
-    frame[2] = (uint8_t)g_config.serialMode;
-    uint8_t crc = LUA_TYPE_SYS ^ frame[2];
-    // btName: 16 bytes (max 15 chars + null-pad)
-    const char* name = g_config.btName;
-    size_t nameLen = strlen(name);
-    for (uint8_t i = 0; i < 16; i++) {
-        frame[3 + i] = (i < nameLen) ? (uint8_t)name[i] : 0;
-        crc ^= frame[3 + i];
-    }
-    // localAddr: 18 bytes (17-char MAC + null-pad)
-    const char* local = bleGetLocalAddress();
-    size_t localLen = local ? strlen(local) : 0;
-    for (uint8_t i = 0; i < 18; i++) {
-        frame[19 + i] = (i < localLen) ? (uint8_t)local[i] : 0;
-        crc ^= frame[19 + i];
-    }
-    // remoteAddr: 18 bytes (saved remote MAC or zeros)
-    const char* remote = g_config.hasRemoteAddr ? g_config.remoteBtAddr : nullptr;
-    size_t remoteLen = remote ? strlen(remote) : 0;
-    for (uint8_t i = 0; i < 18; i++) {
-        frame[37 + i] = (i < remoteLen) ? (uint8_t)remote[i] : 0;
-        crc ^= frame[37 + i];
-    }
-    // apSsid: 16 bytes (max 15 chars + null-pad)
-    const char* ssid = g_config.apSsid;
-    size_t ssidLen = strlen(ssid);
-    for (uint8_t i = 0; i < 16; i++) {
-        frame[55 + i] = (i < ssidLen) ? (uint8_t)ssid[i] : 0;
-        crc ^= frame[55 + i];
-    }
-    // udpPort: 2 bytes big-endian
-    frame[71] = (uint8_t)(g_config.udpPort >> 8);
-    frame[72] = (uint8_t)(g_config.udpPort & 0xFF);
-    crc ^= frame[71]; crc ^= frame[72];
-    // apPass: 16 bytes (max 15 chars + null-pad)
-    const char* pass = g_config.apPass;
-    size_t passLen = strlen(pass);
-    for (uint8_t i = 0; i < 16; i++) {
-        frame[73 + i] = (i < passLen) ? (uint8_t)pass[i] : 0;
-        crc ^= frame[73 + i];
-    }
-    // baudIdx: 0=57600, 1=115200
-    frame[89] = (g_config.sportBaud == 115200) ? 1 : 0;
-    crc ^= frame[89];
-    frame[90] = crc;
-    uart_write_bytes(UART_NUM_1, (const char*)frame, SYS_FRAME_LEN);
-}
-
-/**
- * @brief Send an ACK frame (4 bytes) in response to a received command.
- * @param result  0x00 = success, 0x01 = error / unknown command
- */
-static void sendAckFrame(uint8_t result) {
-    uint8_t crc = LUA_TYPE_ACK ^ result;
-    uint8_t frame[ACK_FRAME_LEN] = {LUA_SYNC, LUA_TYPE_ACK, result, crc};
-    uart_write_bytes(UART_NUM_1, (const char*)frame, ACK_FRAME_LEN);
-    // Flush before any potential restart so the radio receives the ACK
-    uart_wait_tx_done(UART_NUM_1, pdMS_TO_TICKS(50));
-}
-
-/**
- * @brief Send a scan status frame (5 bytes).
- * @param state  0=idle, 1=scanning, 2=complete
- * @param count  number of results (valid when state==2)
- */
 static void sendScanStatusFrame(uint8_t state, uint8_t count) {
-    uint8_t crc = LUA_TYPE_SCAN_STATUS ^ state ^ count;
-    uint8_t frame[SCAN_STATUS_FRAME_LEN] = {
-        LUA_SYNC, LUA_TYPE_SCAN_STATUS, state, count, crc
-    };
-    uart_write_bytes(UART_NUM_1, (const char*)frame, SCAN_STATUS_FRAME_LEN);
+    uint8_t p[2] = { state, count };
+    sendFrame(LUA_CH_INFO, LUA_PT_INFO_SCAN_STATUS, p, 2);
 }
 
-/**
- * @brief Send a single scan result entry frame (40 bytes).
- * @param index  index into s_scanCache[]
- */
 static void sendScanEntryFrame(uint8_t index) {
     if (index >= s_scanSendTotal) return;
     const BleScanResult& dev = s_scanCache[index];
 
-    uint8_t frame[SCAN_ENTRY_FRAME_LEN];
-    frame[0] = LUA_SYNC;
-    frame[1] = LUA_TYPE_SCAN_ENTRY;
-    frame[2] = index;
-    frame[3] = (uint8_t)(int8_t)dev.rssi;  // signed → unsigned byte
-    frame[4] = dev.hasFrskyService ? 1 : 0;
+    uint8_t buf[64];
+    uint8_t pos = 0;
 
-    uint8_t crc = LUA_TYPE_SCAN_ENTRY ^ frame[2] ^ frame[3] ^ frame[4];
+    buf[pos++] = index;
+    buf[pos++] = (uint8_t)(int8_t)dev.rssi;
+    buf[pos++] = dev.hasFrskyService ? 0x01 : 0x00;
 
-    // name: 16 bytes null-padded
-    size_t nameLen = strlen(dev.name);
-    for (uint8_t i = 0; i < 16; i++) {
-        frame[5 + i] = (i < nameLen) ? (uint8_t)dev.name[i] : 0;
-        crc ^= frame[5 + i];
-    }
-    // addr: 18 bytes null-padded
-    size_t addrLen = strlen(dev.address);
-    for (uint8_t i = 0; i < 18; i++) {
-        frame[21 + i] = (i < addrLen) ? (uint8_t)dev.address[i] : 0;
-        crc ^= frame[21 + i];
+    uint8_t nlen = (uint8_t)strlen(dev.name);
+    buf[pos++] = nlen;
+    memcpy(&buf[pos], dev.name, nlen);
+    pos += nlen;
+
+    // addr: 17 bytes, null-padded
+    size_t alen = strlen(dev.address);
+    for (uint8_t i = 0; i < 17; i++) {
+        buf[pos++] = (i < alen) ? (uint8_t)dev.address[i] : 0;
     }
 
-    frame[39] = crc;
-    uart_write_bytes(UART_NUM_1, (const char*)frame, SCAN_ENTRY_FRAME_LEN);
+    sendFrame(LUA_CH_INFO, LUA_PT_INFO_SCAN_ITEM, buf, pos);
 }
 
-// ─── RX parser ──────────────────────────────────────────────────────
+static void wifiScanTask(void*) {
+    int16_t n       = WiFi.scanNetworks(/*async=*/false);
+    LOG_I("LUA", "WiFi scan complete: %d networks", n);
+    s_wifiScanCount = (n < 0) ? 0 : n;
+    s_wifiScanDone  = true;
+    vTaskDelete(nullptr);
+}
 
-static void executeCommand(uint8_t cmd) {
-    switch (cmd) {
-        case LUA_CMD_TOGGLE_AP:
-            LOG_I("LUA", "Received CMD: Toggle AP mode");
-            sendAckFrame(0x00);
-            mainRequestApMode();
-            break;
-        case LUA_CMD_AP_ON:
-            LOG_I("LUA", "Received CMD: AP mode ON");
-            if (g_config.telemetryOutput == TelemetryOutput::BLE) {
-                // BLE and WiFi AP share the same radio — clear BLE telemetry before entering AP mode
+static void sendWifiScanStatusFrame(uint8_t state, uint8_t count) {
+    uint8_t p[2] = { state, count };
+    sendFrame(LUA_CH_INFO, LUA_PT_INFO_WIFI_SCAN_STATUS, p, 2);
+}
+
+static void sendWifiScanItemFrame(uint8_t index) {
+    String  ssid  = WiFi.SSID(index);
+    int8_t  rssi  = (int8_t)WiFi.RSSI(index);
+    uint8_t slen  = (uint8_t)std::min(ssid.length(), (size_t)32);
+    uint8_t buf[36];
+    uint8_t pos = 0;
+    buf[pos++] = index;
+    buf[pos++] = (uint8_t)rssi;
+    buf[pos++] = slen;
+    for (uint8_t i = 0; i < slen; i++) buf[pos++] = (uint8_t)ssid[i];
+    sendFrame(LUA_CH_INFO, LUA_PT_INFO_WIFI_SCAN_ITEM, buf, pos);
+}
+
+// ── TRANS handler (CH_TRANS, PT_TRANS_SPORT) ─────────────────────────
+// payload: physId(1) primId(1) dataId_lo(1) dataId_hi(1) value(4 LE) = 8 bytes
+
+static void handleTransFrame(const uint8_t* payload, uint8_t len) {
+    if (len < 8) return;
+    if (g_config.telemetryOutput == TelemetryOutput::NONE) return;
+
+    if (!s_tlmOutputActive) {
+        sportOutputInit();
+        s_tlmOutputActive = true;
+    }
+
+    SportPacket pkt;
+    pkt.physId = payload[0];
+    pkt.primId = payload[1];
+    pkt.dataId = payload[2] | ((uint16_t)payload[3] << 8);
+    pkt.value  = payload[4] | ((uint32_t)payload[5] << 8)
+               | ((uint32_t)payload[6] << 16) | ((uint32_t)payload[7] << 24);
+
+    sportOutputForwardPacket(&pkt);
+}
+
+// ── PREF_SET handler ─────────────────────────────────────────────────
+
+static void handlePrefSet(const uint8_t* payload, uint8_t len) {
+    if (len < 2) { sendPrefAck(0, 0x01); return; }
+
+    uint8_t id    = payload[0];
+    // uint8_t ftype = payload[1];  // informational, not used for routing
+    uint8_t pos   = 2;
+
+    switch (id) {
+        case LUA_PREF_WIFI_MODE: {
+            if (pos >= len) { sendPrefAck(id, 0x01); return; }
+            uint8_t newIdx = payload[pos];
+            if (newIdx > 2)  { sendPrefAck(id, 0x01); return; }
+
+            // Cascade: switching away from WiFi mode (Off) clears WiFi telem output
+            if (newIdx == 0 && g_config.telemetryOutput == TelemetryOutput::WIFI_UDP) {
                 g_config.telemetryOutput = TelemetryOutput::NONE;
                 configSave();
             }
-            sendAckFrame(0x00);
-            mainRequestApMode();
-            break;
-        case LUA_CMD_AP_OFF:
-            LOG_I("LUA", "Received CMD: AP mode OFF (normal)");
-            // If Telemetry AP was active (WiFi UDP output), clear it to NONE so
-            // the board doesn't redirect back to Telemetry AP mode on next boot.
-            if (g_config.telemetryOutput == TelemetryOutput::WIFI_UDP) {
+            // Cascade: AP/STA mode can't coexist with BLE telem
+            if (newIdx != 0 && g_config.telemetryOutput == TelemetryOutput::BLE) {
                 g_config.telemetryOutput = TelemetryOutput::NONE;
                 configSave();
             }
-            sendAckFrame(0x00);
-            mainRequestNormalMode();
+
+            sendPrefAck(id, 0x00);
+            mainSetWifiMode(newIdx);  // saves config + selects boot mode + restarts
             break;
-        case LUA_CMD_DEV_TRAINER_IN:
-            LOG_I("LUA", "Received CMD: Device mode -> Trainer IN");
-            if (g_config.telemetryOutput != TelemetryOutput::NONE) {
+        }
+
+        case LUA_PREF_DEV_MODE: {
+            if (pos >= len) { sendPrefAck(id, 0x01); return; }
+            uint8_t newIdx = payload[pos];
+            if (newIdx > 2) { sendPrefAck(id, 0x01); return; }
+
+            // Cascade: Trainer modes clear telemetry output
+            if (newIdx != 2 && g_config.telemetryOutput != TelemetryOutput::NONE) {
                 g_config.telemetryOutput = TelemetryOutput::NONE;
                 configSave();
+                sendPrefUpdate(LUA_PREF_TELEM_OUT);
             }
-            sendAckFrame(0x00);
-            mainSetDeviceMode(0);
+            sendPrefAck(id, 0x00);
+            mainSetDeviceMode(newIdx);
             break;
-        case LUA_CMD_DEV_TRAINER_OUT:
-            LOG_I("LUA", "Received CMD: Device mode -> Trainer OUT");
-            if (g_config.telemetryOutput != TelemetryOutput::NONE) {
-                g_config.telemetryOutput = TelemetryOutput::NONE;
-                configSave();
+        }
+
+        case LUA_PREF_TELEM_OUT: {
+            if (pos >= len) { sendPrefAck(id, 0x01); return; }
+            uint8_t newIdx = payload[pos];
+            if (newIdx > 2) { sendPrefAck(id, 0x01); return; }
+            sendPrefAck(id, 0x00);
+            mainSetTelemOutput(newIdx);
+            break;
+        }
+
+        case LUA_PREF_MIRROR_BAUD: {
+            if (pos >= len) { sendPrefAck(id, 0x01); return; }
+            uint32_t baud = (payload[pos] == 1) ? 115200 : 57600;
+            sendPrefAck(id, 0x00);
+            mainSetMirrorBaud(baud);
+            break;
+        }
+
+        case LUA_PREF_MAP_MODE: {
+            if (pos >= len) { sendPrefAck(id, 0x01); return; }
+            g_config.trainerMapMode = (payload[pos] == 0)
+                                      ? TrainerMapMode::MAP_GV
+                                      : TrainerMapMode::MAP_TR;
+            configSave();
+            sendPrefAck(id, 0x00);
+            sendPrefUpdate(LUA_PREF_MAP_MODE);
+            break;
+        }
+
+        case LUA_PREF_BT_NAME: {
+            if (pos >= len) { sendPrefAck(id, 0x01); return; }
+            uint8_t vlen = payload[pos++];
+            if (vlen == 0 || pos + vlen > len) { sendPrefAck(id, 0x01); return; }
+            char str[16] = {};
+            memcpy(str, &payload[pos], std::min((int)vlen, 15));
+            strlcpy(g_config.btName, str, sizeof(g_config.btName));
+            configSave();
+            bleUpdateAdvertisingName();
+            sendPrefAck(id, 0x00);
+            sendPrefUpdate(LUA_PREF_BT_NAME);
+            sendInfoUpdate(LUA_INFO_BT_ADDR);  // BT name change may affect discovery
+            break;
+        }
+
+        case LUA_PREF_AP_SSID: {
+            if (pos >= len) { sendPrefAck(id, 0x01); return; }
+            uint8_t vlen = payload[pos++];
+            if (vlen == 0 || pos + vlen > len) { sendPrefAck(id, 0x01); return; }
+            char str[16] = {};
+            memcpy(str, &payload[pos], std::min((int)vlen, 15));
+            strlcpy(g_config.apSsid, str, sizeof(g_config.apSsid));
+            configSave();
+            sendPrefAck(id, 0x00);
+            ESP.restart();
+            break;
+        }
+
+        case LUA_PREF_UDP_PORT: {
+            if (pos >= len) { sendPrefAck(id, 0x01); return; }
+            uint8_t vlen = payload[pos++];
+            char str[6] = {};
+            memcpy(str, &payload[pos], std::min((int)vlen, 5));
+            uint16_t port = (uint16_t)atoi(str);
+            if (port < 1024 || port > 65535) { sendPrefAck(id, 0x01); return; }
+            g_config.udpPort = port;
+            configSave();
+            sendPrefAck(id, 0x00);
+            ESP.restart();
+            break;
+        }
+
+        case LUA_PREF_AP_PASS: {
+            if (pos >= len) { sendPrefAck(id, 0x01); return; }
+            uint8_t vlen = payload[pos++];
+            if (vlen < 8 || pos + vlen > len) { sendPrefAck(id, 0x01); return; }
+            char str[16] = {};
+            memcpy(str, &payload[pos], std::min((int)vlen, 15));
+            strlcpy(g_config.apPass, str, sizeof(g_config.apPass));
+            configSave();
+            sendPrefAck(id, 0x00);
+            ESP.restart();
+            break;
+        }
+
+        case LUA_PREF_STA_SSID: {
+            if (pos >= len) { sendPrefAck(id, 0x01); return; }
+            uint8_t vlen = payload[pos++];
+            if (vlen == 0 || pos + vlen > len) { sendPrefAck(id, 0x01); return; }
+            char str[32] = {};
+            memcpy(str, &payload[pos], std::min((int)vlen, 31));
+            strlcpy(g_config.staSsid, str, sizeof(g_config.staSsid));
+            configSave();
+            sendPrefAck(id, 0x00);
+            // No restart — password editor will follow; restart on STA_PASS save.
+            break;
+        }
+
+        case LUA_PREF_STA_PASS: {
+            if (pos >= len) { sendPrefAck(id, 0x01); return; }
+            uint8_t vlen = payload[pos++];
+            if (pos + vlen > len) { sendPrefAck(id, 0x01); return; }
+            char str[64] = {};
+            memcpy(str, &payload[pos], std::min((int)vlen, 63));
+            strlcpy(g_config.staPass, str, sizeof(g_config.staPass));
+            configSave();
+            sendPrefAck(id, 0x00);
+            // Only restart if SSID exists and WiFi mode is STA
+            if (g_config.staSsid[0] != '\0' && g_config.wifiMode == WifiMode::STA) {
+                ESP.restart();
             }
-            sendAckFrame(0x00);
-            mainSetDeviceMode(1);
             break;
-        case LUA_CMD_DEV_TELEMETRY:
-            LOG_I("LUA", "Received CMD: Device mode -> Telemetry");
-            sendAckFrame(0x00);
-            mainSetDeviceMode(2);
+        }
+
+        default:
+            LOG_W("LUA", "PREF_SET: unknown pref id 0x%02X", id);
+            sendPrefAck(id, 0x01);
             break;
-        case LUA_CMD_REQUEST_INFO:
-            LOG_I("LUA", "Received CMD: Request info");
-            sendConfigFrame();
-            sendInfoFrame();
-            sendSysFrame();
-            s_lastCfgMs = millis();  // reset timer so periodic resync doesn't double-fire
-            break;
-        case LUA_CMD_HEARTBEAT:
-            // No-op: purpose is to update s_lastToolsCmdMs (done in processRxByte)
-            sendAckFrame(0x00);
-            break;
-        case LUA_CMD_BLE_SCAN:
-            LOG_I("LUA", "Received CMD: BLE scan start");
+    }
+}
+
+// ── Frame dispatcher (after CRC validation) ──────────────────────────
+
+static void dispatchRxFrame(uint8_t ch, uint8_t typ, const uint8_t* payload, uint8_t len) {
+    if (ch == LUA_CH_PREF) {
+        if (typ == LUA_PT_PREF_REQUEST) {
+            LOG_I("LUA", "PREF_REQUEST");
+            sendPrefAll();
+        } else if (typ == LUA_PT_PREF_SET) {
+            handlePrefSet(payload, len);
+        }
+
+    } else if (ch == LUA_CH_INFO) {
+        if (typ == LUA_PT_INFO_REQUEST) {
+            LOG_I("LUA", "INFO_REQUEST");
+            sendPrefAll();
+            sendInfoAll();
+            sendStatusFrame();
+            s_lastCfgMs = millis();
+
+        } else if (typ == LUA_PT_INFO_HEARTBEAT) {
+            // s_lastToolsCmdMs already bumped by processRxByte
+
+        } else if (typ == LUA_PT_INFO_BLE_SCAN) {
+            LOG_I("LUA", "BLE scan start");
             if (bleScanStart()) {
-                sendAckFrame(0x00);
-                sendScanStatusFrame(1, 0);  // notify: scanning started
+                sendScanStatusFrame(1, 0);
             } else {
-                sendAckFrame(0x01);  // scan could not start
-                sendScanStatusFrame(0, 0);  // notify: idle (not scanning)
+                sendScanStatusFrame(0, 0);
             }
-            break;
-        case LUA_CMD_BLE_DISCONNECT:
-            LOG_I("LUA", "Received CMD: BLE disconnect");
+
+        } else if (typ == LUA_PT_INFO_BLE_CONNECT && len >= 1) {
+            uint8_t idx = payload[0];
+            if (idx < s_scanSendTotal) {
+                LOG_I("LUA", "BLE connect to scan[%u]", idx);
+                bleConnectTo(s_scanCache[idx].address);
+            } else {
+                LOG_W("LUA", "BLE connect: scan index %u out of range", idx);
+            }
+
+        } else if (typ == LUA_PT_INFO_BLE_DISCONNECT) {
+            LOG_I("LUA", "BLE disconnect");
             bleDisconnect();
-            sendAckFrame(0x00);
-            break;
-        case LUA_CMD_BLE_FORGET:
-            LOG_I("LUA", "Received CMD: BLE forget");
+
+        } else if (typ == LUA_PT_INFO_BLE_FORGET) {
+            LOG_I("LUA", "BLE forget");
             bleForget();
-            sendAckFrame(0x00);
-            sendSysFrame();  // re-push SYS with cleared remoteAddr
-            break;
-        case LUA_CMD_BLE_RECONNECT:
-            LOG_I("LUA", "Received CMD: BLE reconnect");
+            sendInfoUpdate(LUA_INFO_REM_ADDR);
+
+        } else if (typ == LUA_PT_INFO_BLE_RECONNECT) {
+            LOG_I("LUA", "BLE reconnect");
             if (g_config.hasRemoteAddr) {
                 bleConnectTo(g_config.remoteBtAddr);
-                sendAckFrame(0x00);
-            } else {
-                sendAckFrame(0x01);  // no saved address
             }
-            break;
-        case LUA_CMD_TELEM_WIFI:
-            LOG_I("LUA", "Received CMD: Telemetry output -> WiFi UDP");
-            sendAckFrame(0x00);
-            mainSetTelemOutput(0);
-            break;
-        case LUA_CMD_TELEM_BLE:
-            LOG_I("LUA", "Received CMD: Telemetry output -> BLE");
-            sendAckFrame(0x00);
-            mainSetTelemOutput(1);
-            break;
-        case LUA_CMD_TELEM_OFF:
-            LOG_I("LUA", "Received CMD: Telemetry output -> Off");
-            sendAckFrame(0x00);
-            mainSetTelemOutput(2);
-            break;
-        case LUA_CMD_BAUD_57600:
-            LOG_I("LUA", "Received CMD: Mirror baud -> 57600");
-            sendAckFrame(0x00);
-            mainSetMirrorBaud(57600);
-            break;
-        case LUA_CMD_BAUD_115200:
-            LOG_I("LUA", "Received CMD: Mirror baud -> 115200");
-            sendAckFrame(0x00);
-            mainSetMirrorBaud(115200);
-            break;
-        case LUA_CMD_MAP_GV:
-            LOG_I("LUA", "Received CMD: Trainer map -> GV");
-            g_config.trainerMapMode = TrainerMapMode::MAP_GV;
-            configSave();
-            sendConfigFrame();
-            s_lastCfgMs = millis();
-            sendAckFrame(0x00);
-            break;
-        case LUA_CMD_MAP_TR:
-            LOG_I("LUA", "Received CMD: Trainer map -> TR");
-            g_config.trainerMapMode = TrainerMapMode::MAP_TR;
-            configSave();
-            sendConfigFrame();
-            s_lastCfgMs = millis();
-            sendAckFrame(0x00);
-            break;
-        default:
-            if (cmd >= LUA_CMD_BLE_CONNECT_0 && cmd <= (LUA_CMD_BLE_CONNECT_0 + 15)) {
-                uint8_t idx = cmd - LUA_CMD_BLE_CONNECT_0;
-                LOG_I("LUA", "Received CMD: BLE connect to scan[%u]", idx);
-                if (idx < s_scanSendTotal) {
-                    bleConnectTo(s_scanCache[idx].address);
-                    sendAckFrame(0x00);
-                } else {
-                    LOG_W("LUA", "Scan index %u out of range (have %u)", idx, s_scanSendTotal);
-                    sendAckFrame(0x01);
-                }
-            } else {
-                LOG_W("LUA", "Unknown command: 0x%02X", cmd);
-                sendAckFrame(0x01);
+
+        } else if (typ == LUA_PT_INFO_WIFI_SCAN) {
+            LOG_I("LUA", "WiFi scan start");
+            if (s_apMode != 0 && !s_wifiScanActive) {
+                s_wifiScanActive  = true;
+                s_wifiScanDone    = false;
+                s_wifiScanCount   = 0;
+                s_wifiScanSendIdx = 0;
+                xTaskCreate(wifiScanTask, "wifiScan", 8192, nullptr, 1, nullptr);
+                sendWifiScanStatusFrame(1, 0);
+            } else if (s_apMode == 0) {
+                LOG_W("LUA", "WiFi scan: not in WiFi mode (apMode=%u)", s_apMode);
+                sendWifiScanStatusFrame(0, 0);
             }
-            break;
+            // else: scan already in progress, ignore duplicate request
+        }
+
+    } else if (ch == LUA_CH_TRANS) {
+        if (typ == LUA_PT_TRANS_SPORT) {
+            handleTransFrame(payload, len);
+        }
     }
 }
 
-/**
- * @brief Process one byte from the RX ring buffer via a state machine.
- *
- * We only need to handle incoming command frames (4 bytes):
- *   [0xAA] [0x02] [CMD] [XOR_CRC]
- * CRC = type ^ cmd
- */
+// ── RX state machine ─────────────────────────────────────────────────
+
 static void processRxByte(uint8_t b) {
     switch (s_rxState) {
         case 0:  // wait for sync
             if (b == LUA_SYNC) s_rxState = 1;
             break;
 
-        case 1:  // got sync — read type
-            if (b == LUA_TYPE_CMD) {
-                s_rxType   = b;
-                s_rxBuf[0] = b;   // store type for CRC
-                s_rxPos    = 1;
-                s_rxNeeded = 2;   // still need: cmd(1) + crc(1)
-                s_rxState  = 2;
-            } else if (b == LUA_TYPE_TLM) {
-                s_rxType   = b;
-                s_rxBuf[0] = b;   // store type for CRC
-                s_rxPos    = 1;
-                s_rxNeeded = 9;   // still need: 8 SportPacket bytes + crc(1)
-                s_rxState  = 2;
-            } else if (b == LUA_TYPE_STR_SET) {
-                s_rxType   = b;
-                s_rxBuf[0] = b;   // store type for CRC
-                s_rxPos    = 1;
-                s_rxNeeded = 18;  // subCmd(1) + data(16) + crc(1)
-                s_rxState  = 2;
-            } else {
-                // Unknown type; if it's another sync, stay in state 1
-                s_rxState = (b == LUA_SYNC) ? 1 : 0;
-            }
+        case 1:  // CH
+            s_rxCh     = b;
+            s_rxCrcAcc = b;
+            s_rxState  = 2;
             break;
 
-        case 2:  // accumulating payload bytes
-            s_rxBuf[s_rxPos++] = b;
-            if (--s_rxNeeded == 0) {
-                if (s_rxType == LUA_TYPE_CMD) {
-                    // s_rxBuf[0]=type, [1]=cmd, [2]=CRC
-                    uint8_t expected_crc = s_rxBuf[0] ^ s_rxBuf[1];
-                    if (s_rxBuf[2] == expected_crc) {
-                        s_lastToolsCmdMs = millis();  // Tools is active
-                        executeCommand(s_rxBuf[1]);
-                    } else {
-                        LOG_W("LUA", "CMD CRC error: got 0x%02X expected 0x%02X",
-                              s_rxBuf[2], expected_crc);
-                    }
-                } else if (s_rxType == LUA_TYPE_TLM) {
-                    handleTlmFrame();
-                } else if (s_rxType == LUA_TYPE_STR_SET) {
-                    // s_rxBuf: [0]=type, [1]=subCmd, [2..17]=data(16), [18]=CRC
-                    uint8_t crc = 0;
-                    for (uint8_t i = 0; i < 18; i++) crc ^= s_rxBuf[i];
-                    if (crc != s_rxBuf[18]) {
-                        LOG_W("LUA", "STR_SET CRC error");
-                    } else {
-                        s_lastToolsCmdMs = millis();  // Tools is active
-                        // Extract null-terminated string from data field
-                        char str[17];
-                        memcpy(str, &s_rxBuf[2], 16);
-                        str[16] = '\0';
-                        uint8_t subCmd = s_rxBuf[1];
-                        if (subCmd == STR_SUB_BT_NAME && strlen(str) > 0) {
-                            strlcpy(g_config.btName, str, sizeof(g_config.btName));
-                            LOG_I("LUA", "BT name set to %s", str);
-                            configSave();
-                            bleUpdateAdvertisingName();
-                            sendAckFrame(0x00);
-                            sendSysFrame();
-                        } else if (subCmd == STR_SUB_SSID && strlen(str) > 0) {
-                            strlcpy(g_config.apSsid, str, sizeof(g_config.apSsid));
-                            LOG_I("LUA", "AP SSID set to %s — restarting", str);
-                            configSave();
-                            sendAckFrame(0x00);
-                            delay(100);
-                            ESP.restart();
-                        } else if (subCmd == STR_SUB_UDP_PORT) {
-                            uint16_t port = (uint16_t)atoi(str);
-                            if (port >= 1024 && port <= 65535) {
-                                g_config.udpPort = port;
-                                LOG_I("LUA", "UDP port set to %u — restarting", port);
-                                configSave();
-                                sendAckFrame(0x00);
-                                delay(100);
-                                ESP.restart();
-                            } else {
-                                sendAckFrame(0x01);
-                            }
-                        } else if (subCmd == STR_SUB_AP_PASS) {
-                            size_t plen = strlen(str);
-                            if (plen >= 8 && plen <= 15) {
-                                strlcpy(g_config.apPass, str, sizeof(g_config.apPass));
-                                LOG_I("LUA", "AP pass updated — restarting");
-                                configSave();
-                                sendAckFrame(0x00);
-                                delay(100);
-                                ESP.restart();
-                            } else {
-                                sendAckFrame(0x01);
-                            }
-                        } else {
-                            sendAckFrame(0x01);
-                        }
-                    }
-                }
-                s_rxState = 0;
+        case 2:  // TYPE
+            s_rxType    = b;
+            s_rxCrcAcc ^= b;
+            s_rxState   = 3;
+            break;
+
+        case 3:  // LEN
+            s_rxLen    = b;
+            s_rxCrcAcc ^= b;
+            s_rxPos    = 0;
+            s_rxState  = (s_rxLen == 0) ? 5 : 4;
+            break;
+
+        case 4:  // accumulate payload
+            if (s_rxPos < sizeof(s_rxBuf)) {
+                s_rxBuf[s_rxPos] = b;
             }
+            s_rxPos++;
+            s_rxCrcAcc ^= b;
+            if (s_rxPos >= s_rxLen) s_rxState = 5;
+            break;
+
+        case 5:  // CRC byte
+            if (b == s_rxCrcAcc) {
+                s_lastToolsCmdMs = millis();
+                dispatchRxFrame(s_rxCh, s_rxType, s_rxBuf,
+                                std::min(s_rxLen, (uint8_t)sizeof(s_rxBuf)));
+            } else {
+                LOG_W("LUA", "CRC error ch=0x%02X typ=0x%02X", s_rxCh, s_rxType);
+            }
+            s_rxState = 0;
             break;
 
         default:
@@ -651,13 +771,13 @@ static void processRxByte(uint8_t b) {
 
 static void readIncoming() {
     uint8_t tmp[64];
-    int len = uart_read_bytes(UART_NUM_1, tmp, sizeof(tmp), 0);
-    for (int i = 0; i < len; i++) {
+    int n = uart_read_bytes(UART_NUM_1, tmp, sizeof(tmp), 0);
+    for (int i = 0; i < n; i++) {
         processRxByte(tmp[i]);
     }
 }
 
-// ─── Public API ─────────────────────────────────────────────────────
+// ── Public API ───────────────────────────────────────────────────────
 
 void luaSerialSetApMode(uint8_t mode) {
     s_apMode = mode;
@@ -677,90 +797,118 @@ void luaSerialInit() {
     ESP_ERROR_CHECK(uart_param_config(UART_NUM_1, &cfg));
     ESP_ERROR_CHECK(uart_set_pin(UART_NUM_1, PIN_SERIAL_TX, PIN_SERIAL_RX,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-    // 256-byte TX buffer, 256-byte RX buffer, no queue, no interrupts
     ESP_ERROR_CHECK(uart_driver_install(UART_NUM_1, 256, 256, 0, NULL, 0));
 
-    s_running      = true;
-    s_rxState      = 0;
-    s_lastChMs     = 0;
-    s_lastStatusMs = 0;
-    s_apMode       = 0;  // caller sets via luaSerialSetApMode() if needed
-    s_lastCfgMs    = millis() - CFG_INTERVAL;  // fire on first loop tick
-    // Reset scan state
-    s_scanWasActive   = false;
-    s_scanSending     = false;
-    s_scanSendIdx     = 0;
-    s_scanSendTotal   = 0;
-    s_lastScanEntryMs = 0;
+    s_running          = true;
+    s_rxState          = 0;
+    s_lastChMs         = 0;
+    s_lastStatusMs     = 0;
+    s_apMode           = 0;
+    s_lastCfgMs        = millis() - LUA_CFG_INTERVAL;  // fire on first loop
+    s_scanWasActive    = false;
+    s_scanSending      = false;
+    s_scanSendIdx      = 0;
+    s_scanSendTotal    = 0;
+    s_lastScanEntryMs  = 0;
+    s_wifiScanDone     = false;
+    s_wifiScanCount    = 0;
+    s_wifiScanActive   = false;
+    s_wifiScanSending  = false;
+    s_wifiScanSendIdx  = 0;
+    s_lastWifiScanMs   = 0;
     s_lastBleConnected = bleIsConnected();
-    s_lastToolsCmdMs   = 0;  // no Tools activity yet
+    s_lastToolsCmdMs   = 0;
+    s_tlmOutputActive  = false;
 
-    LOG_I("LUA", "Initialized: TX=%d RX=%d @ %lu baud (8N1)",
+    LOG_I("LUA", "Init: TX=%d RX=%d @ %lu baud (new CH/TYPE/LEN protocol)",
           PIN_SERIAL_TX, PIN_SERIAL_RX, LUA_BAUD);
 }
 
 void luaSerialLoop() {
     if (!s_running) return;
 
-    // Process any incoming bytes first so CMD_REQ_INFO is handled before
-    // this iteration's outgoing frames are appended to the TX FIFO.
     readIncoming();
 
     uint32_t now = millis();
 
-    // Send channel frame at ~50 Hz only when BLE is connected and data is fresh
-    if (now - s_lastChMs >= CH_FRAME_INTERVAL) {
+    // Channel frame ~100 Hz — only while BLE connected, data is fresh, and not scanning
+    if (now - s_lastChMs >= LUA_CH_FRAME_INTERVAL) {
         s_lastChMs = now;
-        if (bleIsConnected() && !g_channelData.isStale(500)) {
+        if (bleIsConnected() && !g_channelData.isStale(500) && !bleIsScanning()) {
             sendChannelFrame();
         }
     }
 
-    // Send status frame every 500 ms
-    if (now - s_lastStatusMs >= STATUS_INTERVAL) {
+    // Status frame every 500 ms
+    if (now - s_lastStatusMs >= LUA_STATUS_INTERVAL) {
         s_lastStatusMs = now;
         bool connected = bleIsConnected();
         sendStatusFrame();
-        // If BLE connection state changed, resend SYS+CFG so Lua updates immediately
+        // BLE state changed → push updated info immediately
+        // On connect: wait until connectTask is done (s_remoteAddr set)
+        // to avoid sending an empty address.
         if (connected != s_lastBleConnected) {
-            s_lastBleConnected = connected;
-            sendSysFrame();
-            sendConfigFrame();
-        }
-    }
-
-    // Periodic resync only while Tools script is active (heartbeat/CMD received recently).
-    // btwfs.lua discards these frames anyway, so no need to send them when Tools is idle.
-    if ((now - s_lastCfgMs >= CFG_INTERVAL) && (now - s_lastToolsCmdMs < TOOLS_IDLE_TIMEOUT)) {
-        s_lastCfgMs = now;
-        sendConfigFrame();
-        sendInfoFrame();
-        sendSysFrame();
-    }
-
-    // ─── BLE scan state tracking ────────────────────────────────────
-    bool scanning = bleIsScanning();
-    if (s_scanWasActive && !scanning) {
-        // Scan just completed → cache results and start drip-feed
-        s_scanSendTotal = bleGetScanResults(s_scanCache, MAX_SCAN_RESULTS);
-        sendScanStatusFrame(2, s_scanSendTotal);
-        s_scanSendIdx   = 0;
-        s_scanSending   = (s_scanSendTotal > 0);
-    }
-    s_scanWasActive = scanning;
-
-    // Drip-feed scan results (one per 20 ms to avoid UART overflow)
-    if (s_scanSending && s_scanSendIdx < s_scanSendTotal) {
-        if (now - s_lastScanEntryMs >= 20) {
-            s_lastScanEntryMs = now;
-            sendScanEntryFrame(s_scanSendIdx++);
-            if (s_scanSendIdx >= s_scanSendTotal) {
-                s_scanSending = false;
+            if (!connected || !bleIsConnecting()) {
+                s_lastBleConnected = connected;
+                sendInfoUpdate(LUA_INFO_REM_ADDR);
             }
         }
     }
 
-    // (incoming bytes already read at the top of this function)
+    // Periodic full resync — only while Tools script is active
+    if ((now - s_lastCfgMs >= LUA_CFG_INTERVAL) &&
+        (now - s_lastToolsCmdMs < LUA_TOOLS_IDLE_TIMEOUT)) {
+        s_lastCfgMs = now;
+        sendPrefAll();
+        sendInfoAll();
+    }
+
+    // BLE scan state tracking + drip-feed
+    bool scanning = bleIsScanning();
+    if (s_scanWasActive && !scanning) {
+        s_scanSendTotal = bleGetScanResults(s_scanCache, MAX_SCAN_RESULTS);
+        sendScanStatusFrame(2, s_scanSendTotal);
+        s_scanSendIdx = 0;
+        s_scanSending = (s_scanSendTotal > 0);
+    }
+    s_scanWasActive = scanning;
+
+    if (s_scanSending && s_scanSendIdx < s_scanSendTotal) {
+        if (now - s_lastScanEntryMs >= 20) {
+            s_lastScanEntryMs = now;
+            sendScanEntryFrame(s_scanSendIdx++);
+            if (s_scanSendIdx >= s_scanSendTotal) s_scanSending = false;
+        }
+    }
+
+    // WiFi scan task completion + drip-feed (items sent before status=2)
+    if (s_wifiScanDone && !s_wifiScanSending) {
+        uint8_t total = (uint8_t)std::min((int16_t)s_wifiScanCount, (int16_t)20);
+        s_wifiScanDone    = false;
+        s_wifiScanSendIdx = 0;
+        if (total > 0) {
+            s_wifiScanSending = true;
+            s_lastWifiScanMs  = now - 30;  // trigger first send immediately
+        } else {
+            sendWifiScanStatusFrame(2, 0);
+            WiFi.scanDelete();
+            s_wifiScanActive = false;
+        }
+    }
+    if (s_wifiScanSending) {
+        uint8_t total = (uint8_t)std::min((int16_t)s_wifiScanCount, (int16_t)20);
+        if (now - s_lastWifiScanMs >= 20) {
+            s_lastWifiScanMs = now;
+            sendWifiScanItemFrame(s_wifiScanSendIdx);
+            s_wifiScanSendIdx++;
+            if (s_wifiScanSendIdx >= total) {
+                s_wifiScanSending = false;
+                s_wifiScanActive  = false;
+                sendWifiScanStatusFrame(2, total);
+                WiFi.scanDelete();
+            }
+        }
+    }
 }
 
 void luaSerialStop() {
@@ -774,3 +922,4 @@ void luaSerialStop() {
         LOG_I("LUA", "Stopped");
     }
 }
+

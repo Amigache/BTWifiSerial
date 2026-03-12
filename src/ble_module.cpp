@@ -552,7 +552,7 @@ bool bleScanStart() {
     pScan->setMaxResults(0);           // Don't store in NimBLE, we handle it
     pScan->start(5, onScanComplete);   // 5 seconds, non-blocking with callback
 
-    LOG_I("BLE", "Scan started (5s)");
+    LOG_I("BLE", "Scan started (5s) interval=100 window=60");
     return true;
 }
 
@@ -584,12 +584,40 @@ static void bleConnectTask(void* /*param*/) {
     }
 
     s_pClient->setConnectionParams(6, 12, 0, 100);
-    s_pClient->setConnectTimeout(5);
+    s_pClient->setConnectTimeout(8);
 
-    NimBLEAddress addr(address, s_pendingAddrType);
+    uint8_t usedAddrType = s_pendingAddrType;
+    NimBLEAddress addr(address, usedAddrType);
 
     if (!s_pClient->connect(addr)) {
-        LOG_E("BLE", "Connection failed");
+        // Retry once with the alternate address type (public <-> random).
+        // Some peripherals advertise/connect with a type that may differ from
+        // cached data or scanner reports depending on stack behavior.
+        uint8_t altType = (usedAddrType == 0) ? 1 : 0;
+        LOG_W("BLE", "Connect failed with addrType=%u, retrying with addrType=%u",
+              usedAddrType, altType);
+
+        // Let controller/link-layer settle before retrying with alternate type.
+        if (s_pClient->isConnected()) {
+            s_pClient->disconnect();
+        }
+        delay(120);
+
+        NimBLEAddress altAddr(address, altType);
+        if (!s_pClient->connect(altAddr)) {
+            LOG_E("BLE", "Connection failed (addrType=%u and addrType=%u)",
+                  usedAddrType, altType);
+            s_connectInProgress = false;
+            s_connectTaskHandle = nullptr;
+            vTaskDelete(nullptr);
+            return;
+        }
+        usedAddrType = altType;
+        LOG_I("BLE", "Connected using fallback addrType=%u", usedAddrType);
+    }
+
+    if (!s_pClient->isConnected()) {
+        LOG_E("BLE", "Connection failed: client not connected after connect()") ;
         s_connectInProgress = false;
         s_connectTaskHandle = nullptr;
         vTaskDelete(nullptr);
@@ -636,10 +664,10 @@ static void bleConnectTask(void* /*param*/) {
     // Save connected address and type for auto-reconnect
     strlcpy(g_config.remoteBtAddr, address, sizeof(g_config.remoteBtAddr));
     g_config.hasRemoteAddr  = true;
-    g_config.remoteAddrType = s_pendingAddrType;
+    g_config.remoteAddrType = usedAddrType;
     configSave();
 
-    LOG_I("BLE", "Connected to %s (addrType=%u) successfully", address, s_pendingAddrType);
+    LOG_I("BLE", "Connected to %s (addrType=%u) successfully", address, usedAddrType);
     // s_connected is set by ClientCallbacks::onConnect callback
     s_connectInProgress = false;
     s_connectTaskHandle = nullptr;
@@ -659,21 +687,28 @@ bool bleConnectTo(const char* address) {
     // Lazy-init BLE controller if not already running (AP mode)
     ensureController();
 
+    // Shared radio (WiFi + BLE): keep WiFi in MIN_MODEM while connecting
+    // so coexistence scheduler can arbitrate time slices reliably.
+    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+
     LOG_I("BLE", "Connecting to %s...", address);
 
     strlcpy(s_pendingAddr, address, sizeof(s_pendingAddr));
     s_autoReconnect = true;  // explicit connect restores auto-reconnect
 
-    // Look up address type from recent scan results; fall back to config or 0
+    // Look up address type from recent scan results; fall back to saved config
+    // only if the device was not found in the scan results.
+    bool foundInScan = false;
     s_pendingAddrType = 0;
     for (uint8_t i = 0; i < s_scanCount; i++) {
         if (strcmp(s_scanResults[i].address, address) == 0) {
             s_pendingAddrType = s_scanResults[i].addrType;
+            foundInScan = true;
             break;
         }
     }
     // If not in scan results (e.g. auto-reconnect), use saved config type
-    if (s_pendingAddrType == 0 && g_config.hasRemoteAddr &&
+    if (!foundInScan && g_config.hasRemoteAddr &&
         strcmp(g_config.remoteBtAddr, address) == 0) {
         s_pendingAddrType = g_config.remoteAddrType;
     }

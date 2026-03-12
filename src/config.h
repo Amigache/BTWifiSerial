@@ -26,6 +26,13 @@ enum class OutputMode : uint8_t {
     LUA_SERIAL   = 4   // EdgeTX LUA serial: bidirectional channel + command protocol
 };
 
+// ─── WiFi mode ──────────────────────────────────────────────────────
+enum class WifiMode : uint8_t {
+    OFF = 0,  // WiFi disabled
+    AP  = 1,  // Soft Access Point (portal / UDP broadcast)
+    STA = 2,  // Station — connect to an existing network
+};
+
 // ─── Telemetry output destination ───────────────────────────────────
 enum class TelemetryOutput : uint8_t {
     WIFI_UDP = 0,  // Broadcast via WiFi UDP
@@ -66,12 +73,15 @@ struct Config {
     // Trainer channel mapping
     TrainerMapMode  trainerMapMode;      // GV (global vars) or TR (trainer channels)
 
-    // WiFi AP settings
+    // WiFi mode + credentials
+    WifiMode        wifiMode;            // Off / AP / STA
     char            apSsid[16];          // AP SSID (max 15 chars + null)
     char            apPass[16];          // AP password (max 15 chars + null)
+    char            staSsid[32];         // STA SSID to connect to (max 31 + null)
+    char            staPass[64];         // STA password (max 63 + null)
 
     void setDefaults() {
-        serialMode      = OutputMode::FRSKY;
+        serialMode      = OutputMode::LUA_SERIAL;
         deviceMode      = DeviceMode::TRAINER_IN;
         strlcpy(btName, "BTWifiSerial", sizeof(btName));
         memset(localBtAddr, 0, sizeof(localBtAddr));
@@ -82,8 +92,11 @@ struct Config {
         udpPort         = 5010;
         sportBaud       = 57600;
         trainerMapMode  = TrainerMapMode::MAP_GV;
+        wifiMode        = WifiMode::OFF;
         strlcpy(apSsid, "BTWifiSerial", sizeof(apSsid));
         strlcpy(apPass, "12345678", sizeof(apPass));
+        memset(staSsid, 0, sizeof(staSsid));
+        memset(staPass, 0, sizeof(staPass));
     }
 };
 
