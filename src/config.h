@@ -81,7 +81,7 @@ struct Config {
     char            staPass[64];         // STA password (max 63 + null)
 
     void setDefaults() {
-        serialMode      = OutputMode::FRSKY;
+        serialMode      = OutputMode::LUA_SERIAL;
         deviceMode      = DeviceMode::TRAINER_IN;
         strlcpy(btName, "BTWifiSerial", sizeof(btName));
         memset(localBtAddr, 0, sizeof(localBtAddr));

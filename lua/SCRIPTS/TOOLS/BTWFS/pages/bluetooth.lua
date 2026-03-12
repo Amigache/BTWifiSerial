@@ -18,29 +18,23 @@ return function(ctx)
   local theme   = ctx.theme
   local proto   = ctx.proto
   local store   = ctx.store
+  local input   = ctx.input
   local sendFrame = ctx.sendFrame
 
   -- ── Event helpers ─────────────────────────────────────────────────
-  local function evEnter(e)
-    return (EVT_VIRTUAL_ENTER ~= nil and e == EVT_VIRTUAL_ENTER)
-        or (EVT_ENTER_BREAK   ~= nil and e == EVT_ENTER_BREAK)
-  end
-  local function evExit(e)
-    return (EVT_VIRTUAL_EXIT ~= nil and e == EVT_VIRTUAL_EXIT)
-        or (EVT_EXIT_BREAK   ~= nil and e == EVT_EXIT_BREAK)
-  end
-  local function evNext(e)
-    return (EVT_VIRTUAL_NEXT ~= nil and e == EVT_VIRTUAL_NEXT)
-        or (EVT_ROT_RIGHT    ~= nil and e == EVT_ROT_RIGHT)
-        or (EVT_PLUS_BREAK   ~= nil and e == EVT_PLUS_BREAK)
-        or (EVT_PLUS_REPT    ~= nil and e == EVT_PLUS_REPT)
-  end
-  local function evPrev(e)
-    return (EVT_VIRTUAL_PREV  ~= nil and e == EVT_VIRTUAL_PREV)
-        or (EVT_ROT_LEFT      ~= nil and e == EVT_ROT_LEFT)
-        or (EVT_MINUS_BREAK   ~= nil and e == EVT_MINUS_BREAK)
-        or (EVT_MINUS_REPT    ~= nil and e == EVT_MINUS_REPT)
-  end
+  local evEnter = input.evEnter
+  local evExit  = input.evExit
+  local evNext  = input.evNext
+  local evPrev  = input.evPrev
+
+  -- ── Async operation state ────────────────────────────────────────
+  local OP_NONE          = "none"
+  local OP_SCANNING      = "scanning"
+  local OP_CONNECTING    = "connecting"
+  local OP_CONNECTED_INFO = "connected_info"
+  local OP_DISCONNECTING = "disconnecting"
+  local OP_RECONNECTING  = "reconnecting"
+  local OP_FORGETTING    = "forgetting"
 
   -- ── Layout constants ──────────────────────────────────────────────
   local PAD    = scale.sx(17)
@@ -153,6 +147,7 @@ return function(ctx)
     self._savedEdit     = false  -- true while edit mode on saved device row
     self._savedToggled  = false  -- true = "Forget" option selected in edit mode
     self._modal         = nil    -- active feedback modal (spinner / error / confirm)
+    self._opState       = OP_NONE
     self._opTick        = 0      -- getTime() when async BLE op started (0 = no op)
     self._scanSentTick  = 0      -- getTime() when last scan was requested
 
@@ -162,20 +157,20 @@ return function(ctx)
         -- Firmware confirmed scan started: clear old results.
         -- Modal is already showing from ENTER press, so only create it if missing.
         self._findList:setRows({})
-        if not (self._modal and self._modal._scanning) then
+        if self._opState ~= OP_SCANNING then
           self._modal = Modal.new({
             type     = "info",
             severity = "info",
             title    = "Scanning...",
             message  = "Looking for BLE devices...",
           })
-          self._modal._scanning = true
           self._modal:show()
+          self._opState = OP_SCANNING
         end
       elseif s.state == 0 then
         -- Scan rejected or idle: close scanning modal (show error if we just requested it)
         self._findList:setRows({})
-        if self._modal and self._modal._scanning then
+        if self._opState == OP_SCANNING then
           self._modal = Modal.new({
             type     = "alert",
             severity = "error",
@@ -183,6 +178,7 @@ return function(ctx)
             message  = "Could not start BLE scan.",
           })
           self._modal:show()
+          self._opState = OP_NONE
           self._scanSentTick = 0
         end
       elseif s.state == 2 then
@@ -190,7 +186,10 @@ return function(ctx)
         -- Use s.count (from the frame) rather than #store.scanResults,
         -- because scan-entry frames haven't arrived yet at this point.
         self._scanSentTick = 0
-        if self._modal and self._modal._scanning then self._modal = nil end
+        if self._opState == OP_SCANNING then
+          self._modal = nil
+          self._opState = OP_NONE
+        end
         if s.count == 0 then
           self._modal = Modal.new({
             type     = "alert",
@@ -221,13 +220,10 @@ return function(ctx)
         self._findList:setRows({})
       end
       -- Close any pending BLE operation modal
-      if self._modal then
-        local t = self._modal._title
-        if self._modal._loadingDevice or self._modal._forgetting
-           or t == "Connecting..." or t == "Connection Failed" then
-          self._modal = nil
-          self._opTick = 0
-        end
+      if self._opState == OP_CONNECTED_INFO or self._opState == OP_FORGETTING or self._opState == OP_CONNECTING then
+        self._modal = nil
+        self._opTick = 0
+        self._opState = OP_NONE
       end
     end
 
@@ -242,9 +238,7 @@ return function(ctx)
 
     -- Auto-close BLE spinners when status changes
     store.on("status", function(s)
-      if not self._modal then return end
-      local title = self._modal._title
-      if title == "Connecting..." then
+      if self._opState == OP_CONNECTING then
         if s.bleConnected then
           self._savedEdit = false; self._savedToggled = false
           store.scanResults = {}; store.scanState = 0
@@ -255,8 +249,8 @@ return function(ctx)
             title    = "Connected",
             message  = "Loading device info...",
           })
-          self._modal._loadingDevice = true
           self._modal:show()
+          self._opState = OP_CONNECTED_INFO
           self._opTick = getTime()
         elseif not s.bleConnecting and self._opTick > 0
                and (getTime() - self._opTick) > 300 then
@@ -270,17 +264,20 @@ return function(ctx)
             message  = "Could not connect to device.",
           })
           self._modal:show()
+          self._opState = OP_NONE
         end
-      elseif title == "Disconnecting..." then
+      elseif self._opState == OP_DISCONNECTING then
         if not s.bleConnected then
           self._modal  = nil
           self._opTick = 0
+          self._opState = OP_NONE
           self._savedEdit = false; self._savedToggled = false
         end
-      elseif title == "Reconnecting..." then
+      elseif self._opState == OP_RECONNECTING then
         if s.bleConnected then
           self._modal  = nil
           self._opTick = 0
+          self._opState = OP_NONE
           self._savedEdit = false; self._savedToggled = false
         end
       end
@@ -325,8 +322,8 @@ return function(ctx)
                   title    = "Forgetting...",
                   message  = "Clearing saved device...",
                 })
-                savedSelf._modal._forgetting = true
                 savedSelf._modal:show()
+                savedSelf._opState = OP_FORGETTING
                 sendFrame(proto.buildInfoBleForget())
               end
             end,
@@ -342,6 +339,7 @@ return function(ctx)
               message  = "Closing BLE connection...",
             })
             self._modal:show()
+            self._opState = OP_DISCONNECTING
             self._opTick = getTime()
             sendFrame(proto.buildInfoBleDisconnect())
           else
@@ -352,6 +350,7 @@ return function(ctx)
               message  = "Connecting to saved device...",
             })
             self._modal:show()
+            self._opState = OP_RECONNECTING
             self._opTick = getTime()
             sendFrame(proto.buildInfoBleReconnect())
           end
@@ -407,6 +406,7 @@ return function(ctx)
             message  = "Opening BLE connection...",
           })
           self._modal:show()
+          self._opState = OP_CONNECTING
           self._opTick = getTime()
         end
         return true
@@ -433,8 +433,8 @@ return function(ctx)
           title    = "Scanning...",
           message  = "Looking for BLE devices...",
         })
-        self._modal._scanning = true
         self._modal:show()
+        self._opState = OP_SCANNING
         return true
       end
     end
@@ -487,7 +487,7 @@ return function(ctx)
     end
 
     -- ── Scan timeout (30 s) ───────────────────────────────────────
-    if self._scanSentTick > 0 and self._modal and self._modal._scanning then
+    if self._scanSentTick > 0 and self._opState == OP_SCANNING then
       if (getTime() - self._scanSentTick) > 3000 then
         self._scanSentTick = 0
         self._modal = Modal.new({
@@ -497,23 +497,27 @@ return function(ctx)
           message  = "No response from device.\nTry again.",
         })
         self._modal:show()
+        self._opState = OP_NONE
       end
     end
 
     -- ── Connection timeout (15 s) ─────────────────────────────────
     if self._opTick > 0 and self._modal then
-      local t = self._modal._title
-        if (t == "Connecting..." or t == "Connected" or t == "Reconnecting..." or t == "Disconnecting...") then
-        if (getTime() - self._opTick) > 1500 then
-          self._opTick = 0
-          self._modal = Modal.new({
-            type     = "alert",
-            severity = "error",
-            title    = "Timeout",
-            message  = "Operation timed out.",
-          })
-          self._modal:show()
-        end
+      local timedOp = self._opState == OP_CONNECTING
+                   or self._opState == OP_CONNECTED_INFO
+                   or self._opState == OP_RECONNECTING
+                   or self._opState == OP_DISCONNECTING
+                   or self._opState == OP_FORGETTING
+      if timedOp and (getTime() - self._opTick) > 1500 then
+        self._opTick = 0
+        self._opState = OP_NONE
+        self._modal = Modal.new({
+          type     = "alert",
+          severity = "error",
+          title    = "Timeout",
+          message  = "Operation timed out.",
+        })
+        self._modal:show()
       end
     end
 

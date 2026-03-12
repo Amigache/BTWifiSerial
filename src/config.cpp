@@ -23,7 +23,7 @@ void configLoad() {
         return;
     }
 
-    g_config.serialMode   = (OutputMode)prefs.getUChar("serialMode", (uint8_t)OutputMode::FRSKY);
+    g_config.serialMode   = (OutputMode)prefs.getUChar("serialMode", (uint8_t)OutputMode::LUA_SERIAL);
     g_config.deviceMode   = (DeviceMode)prefs.getUChar("devMode", (uint8_t)DeviceMode::TRAINER_IN);
     g_config.hasRemoteAddr = prefs.getBool("hasRmtAddr", false);
 

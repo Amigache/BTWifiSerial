@@ -20,6 +20,7 @@
  *     {"cmd":"disconnectBt"}
  *     {"cmd":"save"}
  *     {"cmd":"reboot"}
+ *     {"cmd":"factoryReset"}
  *
  *   Server -> Client:
  *     {"type":"status", ...}
@@ -76,10 +77,13 @@ h1{text-align:center;color:var(--ac);margin-bottom:14px;font-size:1.1em;letter-s
 label{display:block;font-size:.82em;color:var(--mu);margin-top:9px;margin-bottom:3px}
 select,input[type=text]{width:100%;padding:6px 8px;border:1px solid var(--bd);background:var(--bg);color:var(--tx);border-radius:3px;font-size:.9em}
 select:focus,input:focus{outline:none;border-color:var(--ac)}
-.btn{display:inline-flex;align-items:center;gap:4px;padding:5px 13px;border:1px solid var(--bd);border-radius:3px;cursor:pointer;font-size:.85em;background:var(--sf);color:var(--tx);transition:border-color .15s,color .15s;margin-top:7px;white-space:nowrap}
+.btn{display:inline-flex;align-items:center;gap:4px;padding:5px 13px;border:1px solid var(--bd);border-radius:3px;cursor:pointer;font-size:.85em;line-height:1;background:var(--sf);color:var(--tx);transition:border-color .15s,color .15s;margin-top:7px;white-space:nowrap}
 .btn:hover{border-color:var(--ac);color:var(--ac)}
 .btn.ac{background:var(--ac);color:#000;border-color:var(--ac)}.btn.ac:hover{background:#79b8ff;border-color:#79b8ff}
 .btn.er{border-color:var(--er);color:var(--er)}.btn.er:hover{background:var(--er);color:#fff;border-color:var(--er)}
+.btn.sys{min-width:132px;height:32px;justify-content:center}
+.btn.sys .ico{width:14px;display:inline-flex;align-items:center;justify-content:center;line-height:1}
+.btn.sys .lbl{line-height:1}
 .btn.sm{padding:3px 8px;font-size:.8em;margin-top:0}
 .irow{display:flex;gap:6px;margin-top:3px}
 .irow input{margin-top:0}
@@ -256,7 +260,8 @@ progress{width:100%;height:8px;margin-top:10px;display:none;accent-color:var(--a
   <div id="otaMsg" class="msg"></div>
   <button class="btn ac" id="btnOta" onclick="doOta()" style="display:none">&#x21A5;&nbsp;Upload</button>
   <div class="ct" style="margin-top:10px">System Actions</div>
-  <button class="btn er" onclick="reboot()">&#x21BA;&nbsp;Reboot</button>
+  <button class="btn sys" style="border-color:var(--wn);color:var(--wn)" onclick="factoryReset()"><span class="ico">&#x26A0;</span><span class="lbl">Factory Reset</span></button>
+  <button class="btn er sys" onclick="reboot()"><span class="ico">&#x21BA;</span><span class="lbl">Reboot</span></button>
 </div>
 
 </div>
@@ -579,6 +584,13 @@ function reboot(){
     'After rebooting the device will start in normal mode and will not return to the configuration page.',
     function(){
       if(send({cmd:'reboot'})) showReboot();
+    });
+}
+function factoryReset(){
+  showConfirm('Factory Reset',
+    'Restore default configuration and reboot? This will erase saved settings (WiFi, BLE pairing, modes).',
+    function(){
+      if(send({cmd:'factoryReset'})) showReboot();
     });
 }
 const drop=document.getElementById('otaDrop');
@@ -931,6 +943,29 @@ static void handleWebSocketMessage(AsyncWebSocketClient* client, uint8_t* data, 
         ESP.restart();
         return;
     }
+      // ─── factoryReset ───────────────────────────────────────────
+      else if (strcmp(cmd, "factoryReset") == 0) {
+        LOG_W("WEB", "Factory reset requested from Web UI");
+
+        g_config.setDefaults();
+        configSave();
+
+        resp["type"]   = "ack";
+        resp["cmd"]    = cmd;
+        resp["ok"]     = true;
+        resp["reboot"] = true;
+
+        String out;
+        serializeJson(resp, out);
+        client->text(out);
+        delay(300);
+
+        // Defaults use WiFi OFF + LUA_SERIAL + Trainer IN.
+        // Boot in normal mode after reset.
+        { Preferences p; p.begin("btwboot", false); p.putUChar("mode", 0); p.end(); }
+        ESP.restart();
+        return;
+      }
     else {
         resp["type"] = "ack";
         resp["cmd"]  = cmd;

@@ -11,9 +11,10 @@ local scale = loadScript(BASE .. "/lib/scale.lua")()
 local theme = loadScript(BASE .. "/lib/theme.lua")()
 local proto = loadScript(BASE .. "/lib/serial_proto.lua")()
 local store = loadScript(BASE .. "/lib/store.lua")()
+local input = loadScript(BASE .. "/lib/input.lua")()
 
 -- ── Build component context (injected into every component) ────────
-local ctx = { scale = scale, theme = theme, proto = proto, store = store }
+local ctx = { scale = scale, theme = theme, proto = proto, store = store, input = input }
 
 -- ── Serial helpers ─────────────────────────────────────────────────
 -- sendFrame(str): write a pre-built frame string to the AUX serial port.

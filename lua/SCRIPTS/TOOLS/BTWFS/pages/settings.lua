@@ -13,6 +13,7 @@ return function(ctx)
   local theme     = ctx.theme
   local proto     = ctx.proto
   local store     = ctx.store
+  local input     = ctx.input
   local sendFrame = ctx.sendFrame
 
   -- ── Charsets for text editing ─────────────────────────────────────
@@ -21,29 +22,14 @@ return function(ctx)
   local NUMSET  = "0123456789"
 
   -- ── Event helpers ─────────────────────────────────────────────────
-  local function evEnter(e)
-    return (EVT_VIRTUAL_ENTER ~= nil and e == EVT_VIRTUAL_ENTER)
-        or (EVT_ENTER_BREAK   ~= nil and e == EVT_ENTER_BREAK)
-  end
-  local function evExit(e)
-    return (EVT_VIRTUAL_EXIT ~= nil and e == EVT_VIRTUAL_EXIT)
-        or (EVT_EXIT_BREAK   ~= nil and e == EVT_EXIT_BREAK)
-  end
-  local function evNext(e)
-    return (EVT_VIRTUAL_NEXT ~= nil and e == EVT_VIRTUAL_NEXT)
-        or (EVT_ROT_RIGHT    ~= nil and e == EVT_ROT_RIGHT)
-        or (EVT_PLUS_BREAK   ~= nil and e == EVT_PLUS_BREAK)
-        or (EVT_PLUS_REPT    ~= nil and e == EVT_PLUS_REPT)
-  end
-  local function evPrev(e)
-    return (EVT_VIRTUAL_PREV  ~= nil and e == EVT_VIRTUAL_PREV)
-        or (EVT_ROT_LEFT      ~= nil and e == EVT_ROT_LEFT)
-        or (EVT_MINUS_BREAK   ~= nil and e == EVT_MINUS_BREAK)
-        or (EVT_MINUS_REPT    ~= nil and e == EVT_MINUS_REPT)
-  end
+  local evEnter = input.evEnter
+  local evExit  = input.evExit
+  local evNext  = input.evNext
+  local evPrev  = input.evPrev
 
   local Settings = {}
   Settings.__index = Settings
+  local buildWifiItems
 
   -- ── Helpers ───────────────────────────────────────────────────────
 
@@ -121,6 +107,7 @@ return function(ctx)
     self._textEdit    = nil   -- active text edit state (nil when inactive)
     self._pickModal   = nil   -- active WiFi-scan picker modal
     self._wifiScanGen = 0     -- generation counter to invalidate stale scan callbacks
+    self._activeWifiScanGen = 0
     self._pendingPassEdit = false  -- auto-open password editor after SSID save
     self._wifiConnCheck  = false  -- show result modal after STA reconnect
     self._wifiConnCheckT = nil    -- deferred timer for wifi check
@@ -246,6 +233,22 @@ return function(ctx)
       end
     end)
 
+    -- WiFi scan listeners are registered once; active scan is generation-gated.
+    store.on("wifi_scan_status", function(ev)
+      if not (self._pickModal and self._pickModal:isOpen()) then return end
+      if self._activeWifiScanGen ~= self._wifiScanGen then return end
+      if ev.state ~= 1 then
+        self._wifiScanStartT = nil
+        self._pickModal:setItems(buildWifiItems())
+      end
+    end)
+
+    store.on("wifi_scan_entry", function(_)
+      if not (self._pickModal and self._pickModal:isOpen()) then return end
+      if self._activeWifiScanGen ~= self._wifiScanGen then return end
+      self._pickModal:setItems(buildWifiItems())
+    end)
+
     return self
   end
 
@@ -366,7 +369,7 @@ return function(ctx)
 
   -- ── WiFi scan picker ───────────────────────────────────────────────
 
-  local function buildWifiItems()
+  buildWifiItems = function()
     local entries = {}
     for _, r in ipairs(store.wifiScanResults) do
       if r then entries[#entries + 1] = r end
@@ -411,7 +414,7 @@ return function(ctx)
 
     -- Bump generation so stale callbacks from a previous scan are ignored
     self._wifiScanGen = self._wifiScanGen + 1
-    local gen = self._wifiScanGen
+    self._activeWifiScanGen = self._wifiScanGen
 
     self._pickModal = PickModal.new({
       title    = "Select WiFi Network",
@@ -437,24 +440,6 @@ return function(ctx)
     self._pickModal:show()
     self._wifiScanStartT = getTime()
     sendFrame(proto.buildInfoWifiScan())
-
-    -- React to scan results (generation-gated so stale callbacks are no-ops)
-    store.on("wifi_scan_status", function(ev)
-      if self._wifiScanGen ~= gen then return end
-      if not (self._pickModal and self._pickModal:isOpen()) then return end
-      -- state=1: scanning in progress, stay in loading state
-      -- state=0 (fail) or state=2 (done): items already received, populate list
-      if ev.state ~= 1 then
-        self._wifiScanStartT = nil
-        self._pickModal:setItems(buildWifiItems())
-      end
-    end)
-
-    store.on("wifi_scan_entry", function(_)
-      if self._wifiScanGen ~= gen then return end
-      if not (self._pickModal and self._pickModal:isOpen()) then return end
-      self._pickModal:setItems(buildWifiItems())
-    end)
   end
 
   -- ── Public API ────────────────────────────────────────────────────
