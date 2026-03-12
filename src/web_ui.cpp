@@ -102,6 +102,10 @@ select:focus,input:focus{outline:none;border-color:var(--ac)}
 progress{width:100%;height:8px;margin-top:10px;display:none;accent-color:var(--ac);border-radius:4px}
 .msg{font-size:.82em;color:var(--wn);margin-top:6px;min-height:1.1em}
 .toast{position:fixed;top:0;left:0;right:0;padding:11px 16px;background:var(--ok);color:#fff;font-size:.85em;text-align:center;z-index:200;transform:translateY(-100%);transition:transform .3s ease}
+.toast.ok{background:var(--ok);color:#fff}
+.toast.info{background:var(--ac);color:#000}
+.toast.warn{background:var(--wn);color:#000}
+.toast.err{background:var(--er);color:#fff}
 .toast.show{transform:translateY(0)}
 .mbg{position:fixed;inset:0;background:rgba(13,17,23,.82);z-index:100;display:flex;align-items:center;justify-content:center}
 .mbox{background:var(--sf);border:1px solid var(--bd);border-radius:4px;padding:20px 18px;max-width:300px;width:92%}
@@ -229,7 +233,7 @@ progress{width:100%;height:8px;margin-top:10px;display:none;accent-color:var(--a
     <button class="btn ac" onclick="saveBluetooth()">&#x1F4BE; Save</button>
   </div>
   <div id="scanCard" style="display:none;margin-top:10px">
-    <label>BLE Scan</label>
+    <label class="ct">BLE Scan</label>
     <div id="cPeer" style="display:none"></div>
     <button class="btn ac" id="btnScan" onclick="scanBt()" style="margin-top:8px">&#x25B6; Scan</button>
     <div id="scanList"></div>
@@ -251,9 +255,7 @@ progress{width:100%;height:8px;margin-top:10px;display:none;accent-color:var(--a
   <progress id="otaPrg" max="100" value="0"></progress>
   <div id="otaMsg" class="msg"></div>
   <button class="btn ac" id="btnOta" onclick="doOta()" style="display:none">&#x21A5;&nbsp;Upload</button>
-</div>
-
-<div class="card" style="text-align:right">
+  <div class="ct" style="margin-top:10px">System Actions</div>
   <button class="btn er" onclick="reboot()">&#x21BA;&nbsp;Reboot</button>
 </div>
 
@@ -282,6 +284,13 @@ let ws,rTimer;
 let systemDirty=false;
 let bluetoothDirty=false;
 let wifiDirty=false;
+let telemDirty=false;
+
+// BLE connection state tracking
+let lastBleConnected=false;
+let bleConnectPending=false;
+let bleConnectTimer=null;
+let toastTimer=null;
 
 // ── WebSocket ──
 function initWS(){
@@ -297,7 +306,7 @@ function send(o){
     ws.send(JSON.stringify(o));
     return true;
   }
-  showToast('WebSocket disconnected. Reconnecting...');
+  showToast('WebSocket disconnected. Reconnecting...',5000,'warn');
   initWS();
   return false;
 }
@@ -326,8 +335,44 @@ function modalCancel(){
 // ── Message handler ──
 function handle(m){
   if(m.type==='ack'&&m.reboot){showReboot();return;}
+  if(m.type==='ack'){
+    if(m.cmd==='connectBt' && m.ok===false){
+      clearTimeout(bleConnectTimer);
+      bleConnectPending=false;
+      showToast('✗ Connection failed',5000,'err');
+      return;
+    }
+    if(m.cmd==='disconnectBt' && m.ok===false){
+      showToast('✗ Disconnect failed',4000,'err');
+      return;
+    }
+    if(m.cmd==='forgetBt' && m.ok===false){
+      showToast('✗ Forget failed',4000,'err');
+      return;
+    }
+  }
   if(m.type==='status'){
     const ok=m.bleConnected;
+    
+    // Detect BLE connection state changes
+    if(bleConnectPending && !ok){
+      // Still waiting for connection (timeout not yet reached)
+    } else if(bleConnectPending && ok){
+      // Connection succeeded!
+      clearTimeout(bleConnectTimer);
+      bleConnectPending=false;
+      showToast('✓ Connected successfully',3000,'ok');
+    } else if(!lastBleConnected && ok){
+      // Spontaneous connection (auto-reconnect)
+      showToast('✓ Connected',3000,'ok');
+    } else if(lastBleConnected && !ok){
+      // Just disconnected
+      if(!bleConnectPending){
+        showToast('⚠ Disconnected',4000,'warn');
+      }
+    }
+    lastBleConnected=ok;
+    
     document.getElementById('bDot').className='dot '+(ok?'ok':'er');
     document.getElementById('bSt').textContent=ok?'Connected':'Disconnected';
     document.getElementById('sMode').textContent=m.serialMode||'--';
@@ -373,12 +418,12 @@ function handle(m){
     const isTelem=m.serialMode==='sport_bt'||m.serialMode==='sport_mirror';
     document.getElementById('telemCard').style.display=isTelem?'':'none';
     if(isTelem){
-      document.getElementById('selTelemOut').value=m.telemOutput||'wifi_udp';
+      if(!telemDirty) document.getElementById('selTelemOut').value=m.telemOutput||'wifi_udp';
       document.getElementById('mirrorBaudRow').style.display=m.serialMode==='sport_mirror'?'':'none';
-      if(m.serialMode==='sport_mirror') document.getElementById('selBaud').value=m.sportBaud||'57600';
+      if(m.serialMode==='sport_mirror' && !telemDirty) document.getElementById('selBaud').value=m.sportBaud||'57600';
       const isUdp=(m.telemOutput||'wifi_udp')==='wifi_udp';
       document.getElementById('udpCfg').style.display=isUdp?'':'none';
-      if(isUdp){
+      if(isUdp && !telemDirty){
         const up=document.getElementById('inUdpPort');
         if(up!==document.activeElement)up.value=m.udpPort||'5010';
       }
@@ -432,9 +477,18 @@ function handle(m){
 }
 
 // ── Actions ──
-function setTelemOutput(v){send({cmd:'setTelemOutput',value:v});}
-function setMirrorBaud(v){send({cmd:'setMirrorBaud',value:v});}
-function setUdpPort(){send({cmd:'setUdpPort',value:document.getElementById('inUdpPort').value});}
+function setTelemOutput(v){
+  if(send({cmd:'setTelemOutput',value:v})) showToast('Telemetry output updated',2500,'ok');
+}
+function setMirrorBaud(v){
+  if(send({cmd:'setMirrorBaud',value:v})) showToast('Mirror baud updated',2500,'ok');
+}
+function setUdpPort(){
+  telemDirty=true;
+  if(send({cmd:'setUdpPort',value:document.getElementById('inUdpPort').value})) {
+    showToast('UDP port updated',2500,'ok');
+  }
+}
 function markSystemDirty(){systemDirty=true;}
 function systemSerialChanged(){
   markSystemDirty();
@@ -482,10 +536,43 @@ function saveWifi(){
     if(send(d)) showReboot();
   });
 }
-function scanBt(){send({cmd:'scanBt'});}
-function connectBt(a){send({cmd:'connectBt',value:a});setTimeout(getStatus,1500);}
-function disconnectBt(){send({cmd:'disconnectBt'});setTimeout(getStatus,500);}
-function forgetBt(){send({cmd:'forgetBt'});setTimeout(getStatus,500);}
+function scanBt(){
+  if(send({cmd:'scanBt'})) showToast('Scanning for devices...',2500,'info');
+}
+function connectBt(a){
+  if(bleConnectPending){
+    showToast('⚠ Connection already in progress',3000,'warn');
+    return;
+  }
+  if(send({cmd:'connectBt',value:a})) {
+    bleConnectPending=true;
+    clearTimeout(bleConnectTimer);
+    showToast('Connecting...',0,'info');
+    // BLE timeout is 5s; wait 7s before declaring failure
+    bleConnectTimer=setTimeout(function(){
+      if(bleConnectPending && !lastBleConnected){
+        bleConnectPending=false;
+        showToast('✗ Connection failed (timeout)',5000,'err');
+      }
+    }, 7000);
+  }
+}
+function disconnectBt(){
+  if(send({cmd:'disconnectBt'})) {
+    clearTimeout(bleConnectTimer);
+    bleConnectPending=false;
+    showToast('Disconnecting...',2500,'info');
+    setTimeout(getStatus, 500);
+  }
+}
+function forgetBt(){
+  if(send({cmd:'forgetBt'})) {
+    clearTimeout(bleConnectTimer);
+    bleConnectPending=false;
+    showToast('Device forgotten',3000,'warn');
+    setTimeout(getStatus, 500);
+  }
+}
 function disconnectClient(){send({cmd:'disconnectClient'});}
 function reboot(){
   showConfirm('Reboot Device',
@@ -504,7 +591,16 @@ function setFile(f){
   document.getElementById('ofn').textContent=f.name+' ('+Math.round(f.size/1024)+' KB)';
   document.getElementById('btnOta').style.display='inline-flex';
 }
-function showToast(m,d){const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),d||4000);}
+function showToast(m,d,type){
+  const t=document.getElementById('toast');
+  if(toastTimer){clearTimeout(toastTimer);toastTimer=null;}
+  t.classList.remove('ok','info','warn','err');
+  t.classList.add(type||'ok');
+  t.textContent=m;
+  t.classList.add('show');
+  if(d===0)return;
+  toastTimer=setTimeout(()=>{t.classList.remove('show');toastTimer=null;},d||4000);
+}
 function doOta(){
   const f=fin.files[0];if(!f)return;
   const pg=document.getElementById('otaPrg'),msg=document.getElementById('otaMsg'),btn=document.getElementById('btnOta');
@@ -652,7 +748,7 @@ static void handleWebSocketMessage(AsyncWebSocketClient* client, uint8_t* data, 
                       : TrainerMapMode::MAP_GV;
       }
 
-      LOG_I("WEB", "System config saved — restarting to AP mode");
+      LOG_I("WEB", "System config saved — restarting");
       configSave();
 
       resp["type"]   = "ack";
@@ -661,7 +757,15 @@ static void handleWebSocketMessage(AsyncWebSocketClient* client, uint8_t* data, 
       resp["reboot"] = true;
       { String out; serializeJson(resp, out); client->text(out); }
       delay(400);
-      { Preferences p; p.begin("btwboot", false); p.putUChar("mode", 1); p.end(); }
+      uint8_t bootMode = 1;  // BOOT_AP_MODE default
+      wifi_mode_t wm = WiFi.getMode();
+      if (wm == WIFI_STA || wm == WIFI_AP_STA) {
+          bootMode = 3;  // BOOT_STA_MODE
+      } else if (g_config.serialMode == OutputMode::LUA_SERIAL &&
+                 g_config.telemetryOutput == TelemetryOutput::WIFI_UDP) {
+          bootMode = 2;  // BOOT_TELEM_AP
+      }
+      { Preferences p; p.begin("btwboot", false); p.putUChar("mode", bootMode); p.end(); }
       ESP.restart();
       return;
     }
@@ -695,13 +799,21 @@ static void handleWebSocketMessage(AsyncWebSocketClient* client, uint8_t* data, 
     else if (strcmp(cmd, "setUdpPort") == 0) {
         const char* val = doc["value"];
         if (val) {
-            g_config.udpPort = (uint16_t)atoi(val);
-            LOG_I("WEB", "UDP port set to %u", g_config.udpPort);
-            configSave();
+            int port = atoi(val);
+            if (port > 0 && port <= 65535) {
+                g_config.udpPort = (uint16_t)port;
+                LOG_I("WEB", "UDP port set to %u", g_config.udpPort);
+                configSave();
+                resp["ok"] = true;
+            } else {
+                LOG_W("WEB", "Invalid UDP port: %d (must be 1-65535)", port);
+                resp["ok"] = false;
+            }
+        } else {
+            resp["ok"] = false;
         }
         resp["type"] = "ack";
         resp["cmd"]  = cmd;
-        resp["ok"]   = true;
     }
     // ─── saveBluetooth ───────────────────────────────────────────
     else if (strcmp(cmd, "saveBluetooth") == 0) {
@@ -791,13 +903,6 @@ static void handleWebSocketMessage(AsyncWebSocketClient* client, uint8_t* data, 
     // ─── disconnectClient (peripheral: kick connected central) ──
     else if (strcmp(cmd, "disconnectClient") == 0) {
         bleKickClient();
-        resp["type"] = "ack";
-        resp["cmd"]  = cmd;
-        resp["ok"]   = true;
-    }
-    // ─── save ───────────────────────────────────────────────────
-    else if (strcmp(cmd, "save") == 0) {
-        configSave();
         resp["type"] = "ack";
         resp["cmd"]  = cmd;
         resp["ok"]   = true;
@@ -1217,6 +1322,9 @@ void webUiLoop() {
         doc["serialMode"] = mStr;
         doc["btName"]     = g_config.btName;
         doc["apSsid"]     = g_config.apSsid;
+        doc["apPass"]     = g_config.apPass;
+        doc["staSsid"]    = g_config.staSsid;
+        doc["staPass"]    = g_config.staPass;
         doc["buildTs"]    = BUILD_TIMESTAMP;
 
         const char* lAddr = bleGetLocalAddress();
@@ -1241,6 +1349,7 @@ void webUiLoop() {
         doc["udpPort"]     = String(g_config.udpPort);
         doc["sportPkts"]   = String(sportGetPacketCount());
         doc["sportPps"]    = String(sportGetPacketsPerSec());
+        doc["mapMode"]     = g_config.trainerMapMode == TrainerMapMode::MAP_TR ? "tr" : "gv";
 
         // WiFi mode: report actual running mode, same logic as getStatus
         {
