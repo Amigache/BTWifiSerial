@@ -5,10 +5,10 @@
 
 return function(ctx)
   local Page      = ctx.Page
-  local Section   = ctx.Section
   local List      = ctx.List
   local Loading   = ctx.Loading
   local Modal     = ctx.Modal
+  local PickModal = ctx.PickModal
   local scale     = ctx.scale
   local theme     = ctx.theme
   local proto     = ctx.proto
@@ -16,7 +16,8 @@ return function(ctx)
   local sendFrame = ctx.sendFrame
 
   -- ── Charsets for text editing ─────────────────────────────────────
-  local CHARSET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 -_@."
+  -- Full printable ASCII (0x20-0x7E, 95 chars) so any WPA2 password can be entered.
+  local CHARSET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 !\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
   local NUMSET  = "0123456789"
 
   -- ── Event helpers ─────────────────────────────────────────────────
@@ -111,15 +112,20 @@ return function(ctx)
       indicators   = ctx.indicators,
     })
 
-    local secY  = self._page.contentY + scale.sy(8)
-    self._section = Section.new({ title = "Configuration", y = secY })
+    local gap   = scale.sy(8)
+    local listY = self._page.contentY + gap
+    local listH = self._page.contentH - gap
 
-    local listY = self._section.contentY
-    local listH = (self._page.contentY + self._page.contentH) - listY
-
-    self._savingId   = nil   -- pref id currently being saved (waiting for ACK)
-    self._modal      = nil   -- active feedback modal
-    self._textEdit   = nil   -- active text edit state (nil when inactive)
+    self._savingId    = nil   -- pref id currently being saved (waiting for ACK)
+    self._modal       = nil   -- active feedback modal
+    self._textEdit    = nil   -- active text edit state (nil when inactive)
+    self._pickModal   = nil   -- active WiFi-scan picker modal
+    self._wifiScanGen = 0     -- generation counter to invalidate stale scan callbacks
+    self._pendingPassEdit = false  -- auto-open password editor after SSID save
+    self._wifiConnCheck  = false  -- show result modal after STA reconnect
+    self._wifiConnCheckT = nil    -- deferred timer for wifi check
+    self._lastCommittedId    = nil  -- track committed text-edit value for row refresh
+    self._lastCommittedValue = nil
 
     self._list = List.new({
       y          = listY,
@@ -166,12 +172,22 @@ return function(ctx)
       rows = store.prefsReady and buildRows(self) or {},
     })
 
-    self._page:addChild(self._section)
     self._page:addChild(self._list)
 
     -- ── React to store events ──────────────────────────────────
     store.on("prefs_ready", function()
-      self._list:setRows(buildRows(self))
+      -- Clear any stale post-save modal (device may have just reconnected after restart).
+      self._modal    = nil
+      self._savingId = nil
+      -- Don't rebuild rows while inline text editor is active (would reset scroll)
+      if not self._textEdit then
+        self._list:setRows(buildRows(self))
+      end
+      -- After STA reconnect from scan-pick flow, check WiFi status
+      if self._wifiConnCheck then
+        self._wifiConnCheck  = false
+        self._wifiConnCheckT = getTime()  -- deferred: status frame not yet processed
+      end
     end)
 
     store.on("pref_changed", function(pref)
@@ -187,14 +203,34 @@ return function(ctx)
       local needsRestart = p and (bit32.band(p.flags, proto.PF_RESTART) ~= 0)
 
       if ev.result == proto.ACK_OK then
+        -- Update the row value immediately from the committed text (firmware won't
+        -- send PREF_UPDATE for STRING prefs that trigger a restart)
+        if self._lastCommittedId == ev.id and self._lastCommittedValue ~= nil then
+          local p2 = store.prefs[ev.id]
+          if p2 then
+            p2.value = self._lastCommittedValue
+            refreshRow(self, p2)
+          end
+          self._lastCommittedId    = nil
+          self._lastCommittedValue = nil
+        end
         if needsRestart then
-          self._modal = Modal.new({
-            type     = "alert",
-            severity = "info",
-            title    = "Restart Required",
-            message  = "Settings saved.\nDevice will restart.",
-          })
-          self._modal:show()
+          -- Device is about to restart; close spinner silently.
+          -- main.lua will show "Reconnecting..." once the device goes offline.
+          self._modal = nil
+        end
+        -- Auto-open password editor after SSID save from WiFi picker
+        if self._pendingPassEdit and ev.id == 0x0A then
+          self._pendingPassEdit = false
+          self._wifiConnCheck   = true  -- check wifi after password save + restart
+          -- Navigate list to STA Password row and open text editor
+          for i, row in ipairs(self._list.rows) do
+            if row._prefId == 0x0B then
+              self._list:setSel(i)
+              self:_startTextEdit(0x0B)
+              break
+            end
+          end
         end
         -- No restart: silent success, spinner already closed.
       else
@@ -251,7 +287,9 @@ return function(ctx)
     self._textEdit = nil
     local p = store.prefs[id]
     if not p then return end
-    self._savingId = id
+    self._savingId           = id
+    self._lastCommittedId    = id
+    self._lastCommittedValue = value
     sendFrame(proto.buildPrefSet(id, proto.FT_STRING, value))
     store.pendingPrefId = id
     self._modal = Modal.new({
@@ -326,9 +364,129 @@ return function(ctx)
   end
 
 
+  -- ── WiFi scan picker ───────────────────────────────────────────────
+
+  local function buildWifiItems()
+    local entries = {}
+    for _, r in ipairs(store.wifiScanResults) do
+      if r then entries[#entries + 1] = r end
+    end
+    table.sort(entries, function(a, b)
+      return (a.rssi or -999) > (b.rssi or -999)
+    end)
+    local items = {}
+    for _, r in ipairs(entries) do
+      items[#items + 1] = {
+        label    = (r.ssid and r.ssid ~= "") and r.ssid or "(hidden)",
+        sublabel = tostring(r.rssi) .. " dBm",
+        value    = (r.ssid and r.ssid ~= "") and r.ssid or "",
+      }
+    end
+    return items
+  end
+
+  function Settings:_startWifiScanPick()
+    -- Guard: WiFi mode must be On (AP or STA)
+    local wmp = store.prefs[0x01]
+    local idx = wmp and wmp.curIdx or 0
+    if idx == 0 then
+      self._modal = Modal.new({
+        type = "alert", severity = "warning",
+        title = "WiFi Off",
+        message = "Enable WiFi mode (AP or STA)\nbefore scanning.",
+      })
+      self._modal:show()
+      return
+    end
+    -- Guard: BLE must not be active (single-radio device)
+    if store.status.bleConnected or store.status.bleConnecting then
+      self._modal = Modal.new({
+        type = "alert", severity = "warning",
+        title = "BLE Active",
+        message = "WiFi scan not available\nwhile BLE is connected.",
+      })
+      self._modal:show()
+      return
+    end
+
+    -- Bump generation so stale callbacks from a previous scan are ignored
+    self._wifiScanGen = self._wifiScanGen + 1
+    local gen = self._wifiScanGen
+
+    self._pickModal = PickModal.new({
+      title    = "Select WiFi Network",
+      onResult = function(item)
+        self._pickModal = nil
+        if item and item.value ~= "" then
+          local p = store.prefs[0x0A]
+          if p then
+            -- Save SSID (firmware won't restart); then auto-open password editor
+            self._savingId = 0x0A
+            self._pendingPassEdit = true
+            sendFrame(proto.buildPrefSet(0x0A, proto.FT_STRING, item.value))
+            store.pendingPrefId = 0x0A
+            self._modal = Modal.new({
+              type = "info", severity = "info",
+              title = "Saving...", message = "Applying change...",
+            })
+            self._modal:show()
+          end
+        end
+      end,
+    })
+    self._pickModal:show()
+    self._wifiScanStartT = getTime()
+    sendFrame(proto.buildInfoWifiScan())
+
+    -- React to scan results (generation-gated so stale callbacks are no-ops)
+    store.on("wifi_scan_status", function(ev)
+      if self._wifiScanGen ~= gen then return end
+      if not (self._pickModal and self._pickModal:isOpen()) then return end
+      -- state=1: scanning in progress, stay in loading state
+      -- state=0 (fail) or state=2 (done): items already received, populate list
+      if ev.state ~= 1 then
+        self._wifiScanStartT = nil
+        self._pickModal:setItems(buildWifiItems())
+      end
+    end)
+
+    store.on("wifi_scan_entry", function(_)
+      if self._wifiScanGen ~= gen then return end
+      if not (self._pickModal and self._pickModal:isOpen()) then return end
+      self._pickModal:setItems(buildWifiItems())
+    end)
+  end
+
   -- ── Public API ────────────────────────────────────────────────────
 
   function Settings:handleEvent(event)
+    -- Deferred WiFi connection check (2s after prefs_ready to let status frames arrive)
+    if self._wifiConnCheckT then
+      if getTime() - self._wifiConnCheckT > 200 then
+        self._wifiConnCheckT = nil
+        local wmp = store.prefs[0x01]
+        if (wmp and wmp.curIdx == 2) and not store.status.wifiClients then
+          self._modal = Modal.new({
+            type = "alert", severity = "warning",
+            title = "Connection Failed",
+            message = "Could not connect to WiFi.\nCheck SSID and password.",
+          })
+          self._modal:show()
+        end
+      end
+    end
+    -- WiFi scan timeout (10 seconds) — only while still loading
+    if self._pickModal and self._pickModal:isOpen() and self._wifiScanStartT then
+      if (getTime() - self._wifiScanStartT) > 1000 then
+        self._pickModal:setItems({})
+        self._wifiScanStartT = nil
+      end
+    end
+    -- PickModal has topmost priority while open
+    if self._pickModal and self._pickModal:isOpen() then
+      self._pickModal:handleEvent(event)
+      return true
+    end
     if self._modal then
       self._modal:handleEvent(event)
       return true
@@ -340,12 +498,19 @@ return function(ctx)
     -- Intercept ENTER for FT_STRING rows before the list handles it
     if evEnter(event) then
       local row = self._list:getSel()
-      if row and row._prefType == proto.FT_STRING then
-        local p = row._prefId and store.prefs[row._prefId]
-        local rdOnly = p and bit32.band(p.flags, proto.PF_RDONLY) ~= 0
-        if p and not rdOnly then
-          self:_startTextEdit(row._prefId)
+      if row then
+        -- Special case: STA SSID opens the WiFi scan picker
+        if row._prefId == 0x0A then
+          self:_startWifiScanPick()
           return true
+        end
+        if row._prefType == proto.FT_STRING then
+          local p = row._prefId and store.prefs[row._prefId]
+          local rdOnly = p and bit32.band(p.flags, proto.PF_RDONLY) ~= 0
+        if p and not rdOnly then
+            self:_startTextEdit(row._prefId)
+            return true
+          end
         end
       end
     end
@@ -423,9 +588,14 @@ return function(ctx)
       if not self._modal:isOpen() then self._modal = nil end
     end
 
+    if self._pickModal then
+      self._pickModal:render()
+      if not self._pickModal:isOpen() then self._pickModal = nil end
+    end
+
     if not store.prefsReady then
       local lx = scale.sx(17)
-      local ly = self._section.contentY + scale.sy(8)
+      local ly = self._page.contentY + scale.sy(8)
       lcd.drawText(lx, ly, "Waiting for device…",
                    (theme.isColor and CUSTOM_COLOR or 0))
     end

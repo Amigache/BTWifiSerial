@@ -90,7 +90,7 @@ return function(ctx)
     self._list = List.new({
       y          = sysListY,
       h          = sysContentH,
-      selectable = true,
+      selectable = false,
       showScroll = true,
       cols = {
         { key = "label" },

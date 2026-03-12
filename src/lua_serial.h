@@ -61,7 +61,7 @@
  *   bit2  PF_DASHBOARD — display on Dashboard System section
  *
  * Preference IDs:
- *   0x01  AP_MODE     ENUM  ["Normal","WiFi AP","Telem AP"]  PF_RESTART|PF_DASHBOARD
+ *   0x01  WIFI_MODE   ENUM  ["Off","AP","STA"]  PF_RESTART|PF_DASHBOARD
  *   0x02  DEV_MODE    ENUM  ["Trainer IN","Trainer OUT","Telemetry"]  PF_RESTART|PF_DASHBOARD
  *   0x03  TELEM_OUT   ENUM  ["WiFi UDP","BLE","Off"]  PF_RESTART|PF_DASHBOARD
  *   0x04  MIRROR_BAUD ENUM  ["57600","115200"]  PF_RESTART
@@ -70,6 +70,8 @@
  *   0x07  AP_SSID     STRING maxLen=15  PF_RESTART
  *   0x08  UDP_PORT    STRING maxLen=5   PF_RESTART
  *   0x09  AP_PASS     STRING maxLen=15  PF_RESTART
+ *   0x0A  STA_SSID    STRING maxLen=31  PF_RESTART
+ *   0x0B  STA_PASS    STRING maxLen=63  PF_RESTART
  *
  * Info IDs:
  *   0x01  FIRMWARE  STRING  build timestamp "DDMMYYYY HHMM"
@@ -121,6 +123,10 @@ static constexpr uint8_t LUA_PT_INFO_BLE_CONNECT    = 0x13;
 static constexpr uint8_t LUA_PT_INFO_BLE_DISCONNECT = 0x14;
 static constexpr uint8_t LUA_PT_INFO_BLE_FORGET     = 0x15;
 static constexpr uint8_t LUA_PT_INFO_BLE_RECONNECT  = 0x16;
+// ── CH_INFO types ── WiFi scan ─────────────────────────────────────
+static constexpr uint8_t LUA_PT_INFO_WIFI_SCAN_STATUS = 0x09;  ///< ESP32→Lua: state(1) count(1); state: 0=fail 1=scanning 2=done
+static constexpr uint8_t LUA_PT_INFO_WIFI_SCAN_ITEM   = 0x0A;  ///< ESP32→Lua: idx(1) rssi_s8(1) ssid_len(1) ssid(N)
+static constexpr uint8_t LUA_PT_INFO_WIFI_SCAN        = 0x17;  ///< Lua→ESP32: start WiFi scan; no payload
 
 // ── CH_TRANS types ───────────────────────────────────────────────────
 static constexpr uint8_t LUA_PT_TRANS_SBUS  = 0x01;
@@ -140,7 +146,7 @@ static constexpr uint8_t LUA_PF_DASHBOARD = 0x04;
 static constexpr uint8_t LUA_PF_NUMERIC   = 0x08;  ///< FT_STRING pref: only digits 0-9 are valid
 
 // ── Preference IDs ───────────────────────────────────────────────────
-static constexpr uint8_t LUA_PREF_AP_MODE     = 0x01;
+static constexpr uint8_t LUA_PREF_WIFI_MODE   = 0x01;  ///< ENUM ["Off","AP","STA"]
 static constexpr uint8_t LUA_PREF_DEV_MODE    = 0x02;
 static constexpr uint8_t LUA_PREF_TELEM_OUT   = 0x03;
 static constexpr uint8_t LUA_PREF_MIRROR_BAUD = 0x04;
@@ -149,7 +155,9 @@ static constexpr uint8_t LUA_PREF_BT_NAME     = 0x06;
 static constexpr uint8_t LUA_PREF_AP_SSID     = 0x07;
 static constexpr uint8_t LUA_PREF_UDP_PORT    = 0x08;
 static constexpr uint8_t LUA_PREF_AP_PASS     = 0x09;
-static constexpr uint8_t LUA_PREF_COUNT       = 9;
+static constexpr uint8_t LUA_PREF_STA_SSID    = 0x0A;
+static constexpr uint8_t LUA_PREF_STA_PASS    = 0x0B;
+static constexpr uint8_t LUA_PREF_COUNT       = 11;
 
 // ── Info IDs ─────────────────────────────────────────────────────────
 static constexpr uint8_t LUA_INFO_FIRMWARE = 0x01;

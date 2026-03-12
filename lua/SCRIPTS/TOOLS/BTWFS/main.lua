@@ -61,24 +61,49 @@ ctx.Loading     = Loading
 local Modal     = loadScript(BASE .. "/components/modal.lua")()(ctx)
 ctx.Modal       = Modal
 
+local PickModal = loadScript(BASE .. "/components/pick_modal.lua")()(ctx)
+ctx.PickModal   = PickModal
+
 local StatusDot = loadScript(BASE .. "/components/status_dot.lua")()(ctx)
 ctx.StatusDot   = StatusDot
 
 -- ── Global status indicators (shared across all pages' footers) ───
 -- Created once; dot colors are updated by store events + conn state.
 local _dotBoard = StatusDot.new({ label = "BOARD", x = 0, y = 0 })
-local _dotAP    = StatusDot.new({ label = "AP",    x = 0, y = 0 })
+local _dotWifi  = StatusDot.new({ label = "WIFI",  x = 0, y = 0 })
 local _dotBLE   = StatusDot.new({ label = "BLE",   x = 0, y = 0 })
 
-local _indicators = { _dotBoard, _dotAP, _dotBLE }
+local _indicators = { _dotBoard, _dotWifi, _dotBLE }
 ctx.indicators    = _indicators   -- pages forward this to Page.new({ indicators=ctx.indicators })
 
 local function _updateDotBoard(connected)
   _dotBoard:setColor(connected and theme.C.green or theme.C.red)
 end
 
-local function _updateDotAP(hasClients)
-  _dotAP:setColor(hasClients and theme.C.green or theme.C.subtext)
+local _wifiActive = false
+
+local function _updateDotWifi(wifiActive)
+  _wifiActive = wifiActive
+  local wmp = store.prefs and store.prefs[0x01]
+  local idx = wmp and wmp.curIdx or 0
+  local label = "WIFI"
+  local color
+  if wifiActive then
+    color = theme.C.green
+    if     idx == 1 then label = "WIFI (AP)"
+    elseif idx == 2 then label = "WIFI (STA)"
+    end
+  elseif idx ~= 0 then
+    -- Mode configured but not yet active (pending restart)
+    color = theme.C.orange
+    if     idx == 1 then label = "WIFI (AP)"
+    elseif idx == 2 then label = "WIFI (STA)"
+    end
+  else
+    color = theme.C.red
+  end
+  _dotWifi:setLabel(label)
+  _dotWifi:setColor(color)
 end
 
 local function _updateDotBLE(connected, connecting)
@@ -87,25 +112,37 @@ local function _updateDotBLE(connected, connecting)
   elseif connecting then
     _dotBLE:setColor(theme.C.orange)
   else
-    _dotBLE:setColor(theme.C.subtext)
+    _dotBLE:setColor(theme.C.red)
   end
 end
 
 -- Initialise all dots to disconnected state
 _updateDotBoard(false)
-_updateDotAP(false)
+_updateDotWifi(false)
 _updateDotBLE(false, false)
 
 -- React to status frames from ESP32
 store.on("status", function(s)
-  _updateDotAP(s.wifiClients)
+  _updateDotWifi(s.wifiClients)
   _updateDotBLE(s.bleConnected, s.bleConnecting)
+end)
+
+-- Re-evaluate WiFi dot when prefs arrive or WiFi Mode pref changes
+store.on("prefs_ready", function()
+  _updateDotWifi(_wifiActive)
+end)
+
+store.on("pref_changed", function(pref)
+  if pref.id == 0x01 then
+    _updateDotWifi(_wifiActive)
+  end
 end)
 
 -- ── Load pages ─────────────────────────────────────────────────────
 local Dashboard = loadScript(BASE .. "/pages/dashboard.lua")()(ctx)
 local Settings  = loadScript(BASE .. "/pages/settings.lua")()(ctx)
 local Bluetooth = loadScript(BASE .. "/pages/bluetooth.lua")()(ctx)
+local Wifi      = loadScript(BASE .. "/pages/wifi.lua")()(ctx)
 
 -- ── Serial frame dispatcher ────────────────────────────────────────
 local _lastRxTick = 0
@@ -132,6 +169,10 @@ local function onFrame(ch, typ, payload)
     elseif typ == proto.PT_INFO_SCAN_STATUS then
       if #payload >= 2 then store.updateScanStatus(payload[1], payload[2]) end
     elseif typ == proto.PT_INFO_SCAN_ITEM   then store.addScanResult(proto.decodeScanItem(payload))
+    elseif typ == proto.PT_INFO_WIFI_SCAN_STATUS then
+      if #payload >= 2 then store.updateWifiScanStatus(payload[1], payload[2]) end
+    elseif typ == proto.PT_INFO_WIFI_SCAN_ITEM then
+      store.addWifiScanResult(proto.decodeWifiScanItem(payload))
     end
   end
   -- CH_TRANS is not consumed by the Tools script (passed through by btwfs)
@@ -231,6 +272,7 @@ local function init()
   pages[1] = Dashboard.new()
   pages[2] = Settings.new()
   pages[3] = Bluetooth.new()
+  pages[4] = Wifi.new()
   navigateTo(1)
 end
 

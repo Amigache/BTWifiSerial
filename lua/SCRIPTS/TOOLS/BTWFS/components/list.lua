@@ -102,6 +102,7 @@ return function(ctx)
     self._showScroll = (props.showScroll ~= false)   -- default true
     self._editCol   = props.editCol                  -- column index for inline edit (nil=disabled)
     self._onEdit    = props.onEdit                   -- callback(row, key, oldVal, newVal)
+    self._rowBg     = props.rowBg                    -- custom non-selected row bg (nil=theme.C.bg)
     self.rows       = props.rows       or {}
     self.cols       = props.cols       or {}
 
@@ -234,7 +235,20 @@ return function(ctx)
   end
 
   function List:handleEvent(event)
-    if not self.selectable then return false end
+    if not self.selectable then
+      -- Purely informative list: scroll the viewport directly, no row highlight.
+      local total   = #self.rows
+      local maxOff  = math.max(0, total - self.maxVisible)
+      if maxOff == 0 then return false end
+      if evNext(event) then
+        self._offset = math.min(self._offset + 1, maxOff)
+        return true
+      elseif evPrev(event) then
+        self._offset = math.max(self._offset - 1, 0)
+        return true
+      end
+      return false
+    end
 
     if self._editing then
       -- In edit mode: scroll cycles options, ENTER confirms, EXIT cancels
@@ -282,7 +296,7 @@ return function(ctx)
         elseif isSel then
           lcd.setColor(CUSTOM_COLOR, theme.C.accent)
         else
-          lcd.setColor(CUSTOM_COLOR, theme.C.bg)
+          lcd.setColor(CUSTOM_COLOR, self._rowBg or theme.C.bg)
         end
         lcd.drawFilledRectangle(self.x, ry, self._rowFillW, self.rowH, CUSTOM_COLOR)
       else
@@ -338,6 +352,10 @@ return function(ctx)
     self.rows    = rows
     self._sel    = math.min(self._sel, math.max(1, #rows))
     self._offset = 0
+    -- Adjust offset so current selection remains visible
+    if self._sel > self.maxVisible then
+      self._offset = self._sel - self.maxVisible
+    end
   end
 
   return List

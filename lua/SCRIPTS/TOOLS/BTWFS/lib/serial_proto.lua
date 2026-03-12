@@ -41,6 +41,9 @@ M.PT_INFO_SCAN_STATUS = 0x07  -- BLE scan state;  payload: state(1) count(1)
                                --   state: 0=idle, 1=scanning, 2=complete
 M.PT_INFO_SCAN_ITEM   = 0x08  -- BLE scan entry;  payload: idx(1) rssi_s8(1) flags(1) name_len(1) name(N) addr(17)
                                --   flags bit0: hasFrsky
+M.PT_INFO_WIFI_SCAN_STATUS = 0x09  -- WiFi scan state; payload: state(1) count(1)
+                                    --   state: 0=fail, 1=scanning, 2=done
+M.PT_INFO_WIFI_SCAN_ITEM   = 0x0A  -- WiFi scan entry; payload: idx(1) rssi_s8(1) ssid_len(1) ssid(N)
 
 -- ── CH_INFO frame types (Lua → ESP32) ────────────────────────────
 M.PT_INFO_REQUEST        = 0x10  -- Request all info + prefs;  no payload
@@ -50,6 +53,7 @@ M.PT_INFO_BLE_CONNECT    = 0x13  -- Connect to scan result;     payload: idx(1)
 M.PT_INFO_BLE_DISCONNECT = 0x14  -- Disconnect;                 no payload
 M.PT_INFO_BLE_FORGET     = 0x15  -- Forget saved device;        no payload
 M.PT_INFO_BLE_RECONNECT  = 0x16  -- Reconnect to saved device;  no payload
+M.PT_INFO_WIFI_SCAN      = 0x17  -- Start WiFi scan;             no payload
 
 -- ── CH_TRANS frame types (bidirectional) ─────────────────────────
 M.PT_TRANS_SBUS  = 0x01
@@ -146,6 +150,10 @@ end
 
 function M.buildInfoBleReconnect()
   return buildFrame(M.CH_INFO, M.PT_INFO_BLE_RECONNECT, {})
+end
+
+function M.buildInfoWifiScan()
+  return buildFrame(M.CH_INFO, M.PT_INFO_WIFI_SCAN, {})
 end
 
 -- Build a transparent passthrough frame.
@@ -356,6 +364,24 @@ function M.decodeScanItem(payload)
     name     = table.concat(nchars),
     addr     = table.concat(achars),
   }
+end
+
+-- Decode INFO_WIFI_SCAN_ITEM payload.
+-- Returns { idx, rssi, ssid }, or nil on error.
+function M.decodeWifiScanItem(payload)
+  local n = #payload
+  if n < 3 then return nil end
+  local pos = 1
+  local idx   = payload[pos]; pos = pos + 1
+  local rssi  = payload[pos]; pos = pos + 1
+  rssi = (rssi >= 128) and (rssi - 256) or rssi
+  local slen  = payload[pos]; pos = pos + 1
+  local chars = {}
+  for i = 1, slen do
+    if pos > n then break end
+    chars[i] = string.char(payload[pos]); pos = pos + 1
+  end
+  return { idx = idx, rssi = rssi, ssid = table.concat(chars) }
 end
 
 -- ── Frame parser ──────────────────────────────────────────────────

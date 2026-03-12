@@ -36,6 +36,10 @@ return function(ctx)
     self._color = c
   end
 
+  function StatusDot:setLabel(lbl)
+    self._label = lbl
+  end
+
   function StatusDot:render()
     if not theme.isColor then
       lcd.drawText(self._x, self._y, self._label, SMLSIZE)

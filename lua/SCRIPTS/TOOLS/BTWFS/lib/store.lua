@@ -37,7 +37,11 @@ M.channels = {}
 -- scanResults[1..N]: scan entry tables
 M.scanState   = 0
 M.scanResults = {}
-
+-- WiFi scan ──────────────────────────────────────────────────────────
+-- wifiScanState: 0=idle/fail, 1=scanning, 2=complete
+-- wifiScanResults[1..N]: { idx, rssi, ssid }
+M.wifiScanState   = 0
+M.wifiScanResults = {}
 -- ── Pending PREF_SET ──────────────────────────────────────────────
 -- Set to the pref id when a PREF_SET frame is sent, cleared on PREF_ACK.
 M.pendingPrefId = nil
@@ -159,6 +163,20 @@ function M.addScanResult(entry)
   if not entry then return end
   M.scanResults[entry.idx + 1] = entry
   emit("scan_entry", entry)
+end
+
+-- WiFi scan ──────────────────────────────────────────────────────────
+
+function M.updateWifiScanStatus(state, count)
+  M.wifiScanState = state
+  if state == 1 then M.wifiScanResults = {} end  -- clear on new scan start
+  emit("wifi_scan_status", { state = state, count = count })
+end
+
+function M.addWifiScanResult(entry)
+  if not entry then return end
+  M.wifiScanResults[entry.idx + 1] = entry
+  emit("wifi_scan_entry", entry)
 end
 
 return M
