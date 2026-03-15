@@ -53,6 +53,7 @@ static AsyncWebSocket s_ws("/ws");
 static bool s_active           = false;
 static bool s_wsAdded          = false;  // handler registered only once
 static bool s_otaPendingRestart = false; // set after successful OTA; restarted from webUiLoop
+static bool s_cfgPendingRestart = false; // config saved but restart not applied yet
 
 // ─── Embedded HTML UI ───────────────────────────────────────────────
 static const char INDEX_HTML[] PROGMEM = R"rawliteral(
@@ -136,6 +137,7 @@ progress{width:100%;height:8px;margin-top:10px;display:none;accent-color:var(--a
   <div class="row"><span class="l">Local Addr</span><span class="v" id="lAddr">--</span></div>
   <div class="row"><span class="l">Remote Addr</span><span class="v" id="rAddr">--</span></div>
   <div class="row"><span class="l">Build</span><span class="v" id="bTs">--</span></div>
+  <div class="row"><span class="l">Pending Restart</span><span class="v" id="rpSt">No</span></div>
 </div>
 
 <div class="card">
@@ -325,16 +327,20 @@ function showReboot(){
 
 // ── Confirm modal ──
 let mCb=null;
+let mCbCancel=null;
 function showConfirm(title,msg,cb){
   document.getElementById('mTitle').textContent=title;
   document.getElementById('mMsg').textContent=msg;
   mCb=cb;
+  mCbCancel=null;
   document.getElementById('modal').style.display='flex';
 }
-function modalOk(){document.getElementById('modal').style.display='none';if(mCb)mCb();mCb=null;}
+function modalOk(){document.getElementById('modal').style.display='none';if(mCb)mCb();mCb=null;mCbCancel=null;}
 function modalCancel(){
   document.getElementById('modal').style.display='none';
+  if(mCbCancel)mCbCancel();
   mCb=null;
+  mCbCancel=null;
 }
 
 // ── Message handler ──
@@ -389,6 +395,7 @@ function handle(m){
     document.getElementById('lAddr').textContent=m.localAddr||'--';
     document.getElementById('rAddr').textContent=m.remoteAddr||'--';
     document.getElementById('bTs').textContent=m.buildTs||'--';
+    document.getElementById('rpSt').textContent=m.restartPending?'Yes':'No';
     if(!systemDirty){
       document.getElementById('selMode').value=m.serialMode;
       document.getElementById('selRole').value=m.deviceMode;
@@ -490,9 +497,14 @@ function setMirrorBaud(v){
 }
 function setUdpPort(){
   telemDirty=true;
-  if(send({cmd:'setUdpPort',value:document.getElementById('inUdpPort').value})) {
-    showToast('UDP port updated',2500,'ok');
-  }
+  const val=document.getElementById('inUdpPort').value;
+  showConfirm('UDP Port','Save UDP port and restart now?',function(){
+    if(send({cmd:'setUdpPort',value:val,restartNow:true})) showReboot();
+  });
+  mCbCancel=function(){
+    if(send({cmd:'setUdpPort',value:val,restartNow:false}))
+      showToast('Saved. Changes apply after restart.',3500,'warn');
+  };
 }
 function markSystemDirty(){systemDirty=true;}
 function systemSerialChanged(){
@@ -510,10 +522,16 @@ function saveSystem(){
     serialMode:document.getElementById('selMode').value,
     mapMode:document.getElementById('selMapMode').value
   };
-  showConfirm('Save System Config','Save System settings and restart the device?',function(){
+  showConfirm('Save System Config','Save settings and restart now?',function(){
     systemDirty=false;
+    d.restartNow=true;
     if(send(d)) showReboot();
   });
+  mCbCancel=function(){
+    systemDirty=false;
+    d.restartNow=false;
+    if(send(d)) showToast('Saved. Changes apply after restart.',3500,'warn');
+  };
 }
 function saveBluetooth(){
   const d={cmd:'saveBluetooth',btName:document.getElementById('inName').value};
@@ -536,10 +554,16 @@ function saveWifi(){
     d.staSsid=document.getElementById('inStaSsid').value;
     d.staPass=document.getElementById('inStaPass').value;
   }
-  showConfirm('Save WiFi Config','Save WiFi settings and restart the device?',function(){
+  showConfirm('Save WiFi Config','Save WiFi settings and restart now?',function(){
     wifiDirty=false;
+    d.restartNow=true;
     if(send(d)) showReboot();
   });
+  mCbCancel=function(){
+    wifiDirty=false;
+    d.restartNow=false;
+    if(send(d)) showToast('Saved. Changes apply after restart.',3500,'warn');
+  };
 }
 function scanBt(){
   if(send({cmd:'scanBt'})) showToast('Scanning for devices...',2500,'info');
@@ -720,6 +744,7 @@ static void handleWebSocketMessage(AsyncWebSocketClient* client, uint8_t* data, 
         resp["udpPort"]     = String(g_config.udpPort);
         resp["sportPkts"]   = String(sportGetPacketCount());
         resp["sportPps"]    = String(sportGetPacketsPerSec());
+        resp["restartPending"] = s_cfgPendingRestart;
 
         // Trainer map mode
         resp["mapMode"]     = g_config.trainerMapMode == TrainerMapMode::MAP_TR ? "tr" : "gv";
@@ -760,26 +785,31 @@ static void handleWebSocketMessage(AsyncWebSocketClient* client, uint8_t* data, 
                       : TrainerMapMode::MAP_GV;
       }
 
-      LOG_I("WEB", "System config saved — restarting");
+      bool restartNow = doc["restartNow"] | false;
+      LOG_I("WEB", "System config saved%s", restartNow ? " — restarting" : " (pending restart)");
       configSave();
+      s_cfgPendingRestart = true;
 
       resp["type"]   = "ack";
       resp["cmd"]    = cmd;
       resp["ok"]     = true;
-      resp["reboot"] = true;
+      resp["reboot"] = restartNow;
       { String out; serializeJson(resp, out); client->text(out); }
-      delay(400);
-      uint8_t bootMode = 1;  // BOOT_AP_MODE default
-      wifi_mode_t wm = WiFi.getMode();
-      if (wm == WIFI_STA || wm == WIFI_AP_STA) {
-          bootMode = 3;  // BOOT_STA_MODE
-      } else if (g_config.serialMode == OutputMode::LUA_SERIAL &&
-                 g_config.telemetryOutput == TelemetryOutput::WIFI_UDP) {
-          bootMode = 2;  // BOOT_TELEM_AP
+      if (restartNow) {
+        delay(400);
+        uint8_t bootMode = 1;  // BOOT_AP_MODE default
+        wifi_mode_t wm = WiFi.getMode();
+        if (wm == WIFI_STA || wm == WIFI_AP_STA) {
+            bootMode = 3;  // BOOT_STA_MODE
+        } else if (g_config.serialMode == OutputMode::LUA_SERIAL &&
+                   g_config.telemetryOutput == TelemetryOutput::WIFI_UDP) {
+            bootMode = 2;  // BOOT_TELEM_AP
+        }
+        { Preferences p; p.begin("btwboot", false); p.putUChar("mode", bootMode); p.end(); }
+        s_cfgPendingRestart = false;
+        ESP.restart();
+        return;
       }
-      { Preferences p; p.begin("btwboot", false); p.putUChar("mode", bootMode); p.end(); }
-      ESP.restart();
-      return;
     }
     // ─── setTelemOutput ─────────────────────────────────────────
     else if (strcmp(cmd, "setTelemOutput") == 0) {
@@ -810,13 +840,16 @@ static void handleWebSocketMessage(AsyncWebSocketClient* client, uint8_t* data, 
     // ─── setUdpPort ─────────────────────────────────────────────
     else if (strcmp(cmd, "setUdpPort") == 0) {
         const char* val = doc["value"];
+      bool restartNow = doc["restartNow"] | false;
         if (val) {
             int port = atoi(val);
             if (port > 0 && port <= 65535) {
                 g_config.udpPort = (uint16_t)port;
                 LOG_I("WEB", "UDP port set to %u", g_config.udpPort);
                 configSave();
+          s_cfgPendingRestart = true;
                 resp["ok"] = true;
+          resp["reboot"] = restartNow;
             } else {
                 LOG_W("WEB", "Invalid UDP port: %d (must be 1-65535)", port);
                 resp["ok"] = false;
@@ -826,6 +859,19 @@ static void handleWebSocketMessage(AsyncWebSocketClient* client, uint8_t* data, 
         }
         resp["type"] = "ack";
         resp["cmd"]  = cmd;
+        if (resp["ok"] && restartNow) {
+          String out;
+          serializeJson(resp, out);
+          client->text(out);
+          delay(300);
+          uint8_t bm = 0;
+          if (g_config.wifiMode == WifiMode::AP) bm = 1;
+          else if (g_config.wifiMode == WifiMode::STA) bm = 3;
+          { Preferences p; p.begin("btwboot", false); p.putUChar("mode", bm); p.end(); }
+          s_cfgPendingRestart = false;
+          ESP.restart();
+          return;
+        }
     }
     // ─── saveBluetooth ───────────────────────────────────────────
     else if (strcmp(cmd, "saveBluetooth") == 0) {
@@ -867,8 +913,11 @@ static void handleWebSocketMessage(AsyncWebSocketClient* client, uint8_t* data, 
                 strlcpy(g_config.staPass, pw, sizeof(g_config.staPass));
         }
 
-        LOG_I("WEB", "WiFi config saved: mode=%s — restarting", wm ? wm : "off");
+          bool restartNow = doc["restartNow"] | false;
+          LOG_I("WEB", "WiFi config saved: mode=%s%s", wm ? wm : "off",
+            restartNow ? " — restarting" : " (pending restart)");
         configSave();
+          s_cfgPendingRestart = true;
 
         uint8_t bootMode = 0;  // BOOT_NORMAL
         if      (newMode == WifiMode::AP)  bootMode = 1;
@@ -877,12 +926,15 @@ static void handleWebSocketMessage(AsyncWebSocketClient* client, uint8_t* data, 
         resp["type"]   = "ack";
         resp["cmd"]    = cmd;
         resp["ok"]     = true;
-        resp["reboot"] = true;
+        resp["reboot"] = restartNow;
         { String out; serializeJson(resp, out); client->text(out); }
-        delay(400);
-        { Preferences p; p.begin("btwboot", false); p.putUChar("mode", bootMode); p.end(); }
-        ESP.restart();
-        return;
+        if (restartNow) {
+          delay(400);
+          { Preferences p; p.begin("btwboot", false); p.putUChar("mode", bootMode); p.end(); }
+          s_cfgPendingRestart = false;
+          ESP.restart();
+          return;
+        }
     }
     // ─── scanBt ─────────────────────────────────────────────────
     else if (strcmp(cmd, "scanBt") == 0) {
@@ -940,6 +992,7 @@ static void handleWebSocketMessage(AsyncWebSocketClient* client, uint8_t* data, 
             bm = 3;  // BOOT_STA_MODE
         }
         { Preferences p; p.begin("btwboot", false); p.putUChar("mode", bm); p.end(); }
+        s_cfgPendingRestart = false;
         ESP.restart();
         return;
     }
@@ -949,6 +1002,7 @@ static void handleWebSocketMessage(AsyncWebSocketClient* client, uint8_t* data, 
 
         g_config.setDefaults();
         configSave();
+        s_cfgPendingRestart = false;
 
         resp["type"]   = "ack";
         resp["cmd"]    = cmd;
@@ -1079,28 +1133,21 @@ void webUiInit() {
     // Prevent the WiFi driver from writing SSID/pass to NVS on its own
     WiFi.persistent(false);
 
+    // Clean driver state before any mode start to avoid residual STA/AP state
+    // after repeated restarts or previous failed connections.
+    WiFi.disconnect(true, true);
+    WiFi.mode(WIFI_OFF);
+    delay(120);
+
     if (g_config.wifiMode == WifiMode::STA) {
         // ── Station mode: connect to an existing WiFi network ──────────
-
-        // Set a stable locally-administered MAC *before* WiFi.mode() initialises
-        // the driver. Using a deterministic value keeps DHCP identity stable,
-        // so STA IP tends to stay consistent across reboots.
-        {
-          uint8_t factoryMac[6];
-          esp_efuse_mac_get_default(factoryMac);
-          uint8_t stableMac[6];
-          memcpy(stableMac, factoryMac, sizeof(stableMac));
-          stableMac[0] = (stableMac[0] & 0xFE) | 0x02;  // unicast + local-admin
-          esp_base_mac_addr_set(stableMac);
-        }
-
         WiFi.mode(WIFI_STA);
         WiFi.setAutoReconnect(false);
-        // Force 20 MHz bandwidth — avoids auth failures on routers using
-        // non-standard HT40 secondary-channel configurations (ch=7, etc.)
-        esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
+      WiFi.setSleep(false);
 
         LOG_D("WEB", "STA MAC: %s", WiFi.macAddress().c_str());
+      LOG_D("WEB", "STA target SSID='%s' passLen=%u",
+          g_config.staSsid, (unsigned)strlen(g_config.staPass));
 
         // Capture disconnect reason for diagnostics
         WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
@@ -1108,52 +1155,15 @@ void webUiInit() {
                   (int)info.wifi_sta_disconnected.reason);
         }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
 
-        // Scan: verify SSID is visible and capture BSSID+channel
-        LOG_D("WEB", "Scanning for SSID='%s' ...", g_config.staSsid);
-        int scanN = WiFi.scanNetworks(/*async=*/false, /*show_hidden=*/false,
-                                      /*passive=*/false, /*max_ms=*/400);
-        uint8_t targetBssid[6] = {};
-        int32_t targetChannel  = 0;
-        bool    targetFound    = false;
+        // Log assigned DHCP IP every time STA gets/re-gets an address.
+        WiFi.onEvent([](WiFiEvent_t, WiFiEventInfo_t) {
+          LOG_I("WEB", "STA got IP: %s", WiFi.localIP().toString().c_str());
+        }, ARDUINO_EVENT_WIFI_STA_GOT_IP);
 
-        if (scanN <= 0) {
-            LOG_E("WEB", "Scan found %d networks", scanN);
-        } else {
-            for (int i = 0; i < scanN; i++) {
-                bool match = (strcmp(WiFi.SSID(i).c_str(), g_config.staSsid) == 0);
-                if (match && !targetFound) {
-                    targetChannel = WiFi.channel(i);
-                    memcpy(targetBssid, WiFi.BSSID(i), 6);
-                    targetFound = true;
-                LOG_I("WEB", "STA target found RSSI=%d ch=%d enc=%d",
-                    WiFi.RSSI(i), WiFi.channel(i), (int)WiFi.encryptionType(i));
-                }
-            }
-        }
-        WiFi.scanDelete();
-        delay(200);  // let radio settle fully after scan before connecting
-
-        // Low-level config: set authmode threshold to match AP's enc=3 (WPA2-PSK),
-        // enable PMF capable (but not required) to satisfy any MFP-capable APs,
-        // and lock to the scanned BSSID+channel for a clean targeted connection.
-        wifi_config_t wifi_cfg = {};
-        strncpy((char*)wifi_cfg.sta.ssid,     g_config.staSsid, sizeof(wifi_cfg.sta.ssid) - 1);
-        strncpy((char*)wifi_cfg.sta.password, g_config.staPass, sizeof(wifi_cfg.sta.password) - 1);
-        wifi_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-        wifi_cfg.sta.pmf_cfg.capable    = true;
-        wifi_cfg.sta.pmf_cfg.required   = false;
-        if (targetFound) {
-            wifi_cfg.sta.channel   = (uint8_t)targetChannel;
-            wifi_cfg.sta.bssid_set = 1;
-            memcpy(wifi_cfg.sta.bssid, targetBssid, 6);
-        }
-        esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
-        esp_wifi_disconnect();  // clear any leftover auth state before connecting
-
-          LOG_I("WEB", "STA connecting SSID='%s' MAC=%s bssid_set=%d ch=%ld",
-            g_config.staSsid, WiFi.macAddress().c_str(),
-              (int)wifi_cfg.sta.bssid_set, targetChannel);
-        esp_wifi_connect();
+      LOG_I("WEB", "STA connecting SSID='%s'", g_config.staSsid);
+      WiFi.disconnect(true);
+      delay(120);
+      WiFi.begin(g_config.staSsid, g_config.staPass);
 
         // Wait up to 15 s for connection
         uint32_t t0 = millis();
@@ -1163,15 +1173,35 @@ void webUiInit() {
         }
 
         if (WiFi.status() != WL_CONNECTED) {
-            LOG_E("WEB", "STA failed: status=%d", (int)WiFi.status());
-            WiFi.disconnect(true);
-            WiFi.mode(WIFI_OFF);
-            return;
+          LOG_W("WEB", "STA targeted connect failed: status=%d; retrying generic connect",
+              (int)WiFi.status());
+
+          // Retry once with a fresh STA session.
+          WiFi.disconnect(true);
+          delay(200);
+          WiFi.mode(WIFI_STA);
+          delay(100);
+          WiFi.setSleep(false);
+          WiFi.begin(g_config.staSsid, g_config.staPass);
+
+          uint32_t t1 = millis();
+          while (WiFi.status() != WL_CONNECTED && millis() - t1 < 12000) {
+            delay(500);
+            LOG_D("WEB", "  retry status=%d elapsed=%lus", (int)WiFi.status(), (millis()-t1)/1000);
+          }
         }
 
-        esp_wifi_set_ps(WIFI_PS_NONE);
-        LOG_I("WEB", "STA connected: IP=%s", WiFi.localIP().toString().c_str());
-        LOG_D("WEB", "Free heap after WiFi start: %u", ESP.getFreeHeap());
+        if (WiFi.status() != WL_CONNECTED) {
+          LOG_E("WEB", "STA failed after retry: status=%d",
+              (int)WiFi.status());
+          WiFi.disconnect(true);
+          WiFi.mode(WIFI_OFF);
+          return;
+        } else {
+          esp_wifi_set_ps(WIFI_PS_NONE);
+          LOG_I("WEB", "STA connected: IP=%s", WiFi.localIP().toString().c_str());
+          LOG_D("WEB", "Free heap after WiFi start: %u", ESP.getFreeHeap());
+        }
 
     } else {
         // ── AP mode (default): create a soft access point ───────────────
@@ -1386,6 +1416,7 @@ void webUiLoop() {
         doc["sportPkts"]   = String(sportGetPacketCount());
         doc["sportPps"]    = String(sportGetPacketsPerSec());
         doc["mapMode"]     = g_config.trainerMapMode == TrainerMapMode::MAP_TR ? "tr" : "gv";
+        doc["restartPending"] = s_cfgPendingRestart;
 
         // WiFi mode: report actual running mode, same logic as getStatus
         {

@@ -43,6 +43,21 @@ return function(ctx)
   -- Text vertical offset inside a row (same formula as List component)
   local txtOff = math.floor((rowH - theme.FH.small) / 2) - scale.sy(3)
 
+  -- Cache theme values
+  local isColor    = theme.isColor
+  local C_text     = theme.C.text
+  local C_subtext  = theme.C.subtext
+  local C_accent   = theme.C.accent
+  local C_editBg   = theme.C.editBg
+  local C_green    = theme.C.green
+  local C_red      = theme.C.red
+  local F_SMALL_CC = theme.F.small + CUSTOM_COLOR
+
+  -- Pre-compute layout constants for drawRow
+  local LABEL_X    = PAD + scale.sx(7)
+  local VAL_X      = PAD + math.floor(rowW * 0.54)
+  local BW_VAL_X   = math.floor(scale.W / 2)
+
   -- ── Helper: read saved remote address from info store ─────────────
   local function remoteAddr()
     local inf = store.info[proto.INFO_REM_ADDR]
@@ -71,26 +86,25 @@ return function(ctx)
 
   -- ── Draw helper: filled row background + label + value ─────────────
   local function drawRow(ry, rw, isFocused, isEditing, labelStr, valueStr, valueColor)
-    if theme.isColor then
+    if isColor then
       if isEditing then
-        lcd.setColor(CUSTOM_COLOR, theme.C.editBg)
+        lcd.setColor(CUSTOM_COLOR, C_editBg)
         lcd.drawFilledRectangle(PAD, ry, rw, rowH, CUSTOM_COLOR)
       elseif isFocused then
-        lcd.setColor(CUSTOM_COLOR, theme.C.accent)
+        lcd.setColor(CUSTOM_COLOR, C_accent)
         lcd.drawFilledRectangle(PAD, ry, rw, rowH, CUSTOM_COLOR)
       end
       local ty = ry + txtOff
-      lcd.setColor(CUSTOM_COLOR, theme.C.text)
-      lcd.drawText(PAD + scale.sx(7), ty, labelStr, theme.F.small + CUSTOM_COLOR)
-      local valFont = theme.F.small + CUSTOM_COLOR
+      lcd.setColor(CUSTOM_COLOR, C_text)
+      lcd.drawText(LABEL_X, ty, labelStr, F_SMALL_CC)
+      local valFont = F_SMALL_CC
       if isEditing then valFont = valFont + BLINK end
-      lcd.setColor(CUSTOM_COLOR, isFocused and theme.C.text or (valueColor or theme.C.subtext))
-      local valX = PAD + math.floor(rowW * 0.54)
-      lcd.drawText(valX, ty, valueStr, valFont)
+      lcd.setColor(CUSTOM_COLOR, isFocused and C_text or (valueColor or C_subtext))
+      lcd.drawText(VAL_X, ty, valueStr, valFont)
     else
       local fl = isFocused and INVERS or 0
       lcd.drawText(PAD, ry + 1, labelStr, SMLSIZE + fl)
-      lcd.drawText(math.floor(scale.W / 2), ry + 1, valueStr, SMLSIZE + fl)
+      lcd.drawText(BW_VAL_X, ry + 1, valueStr, SMLSIZE + fl)
     end
   end
 
@@ -452,9 +466,9 @@ return function(ctx)
     local focused = (self._focus == 0)
 
     if not addr then
-      if theme.isColor then
-        lcd.setColor(CUSTOM_COLOR, theme.C.subtext)
-        lcd.drawText(PAD + scale.sx(7), ry + txtOff, "No saved device", theme.F.small + CUSTOM_COLOR)
+      if isColor then
+        lcd.setColor(CUSTOM_COLOR, C_subtext)
+        lcd.drawText(LABEL_X, ry + txtOff, "No saved device", F_SMALL_CC)
       else
         lcd.drawText(PAD, ry + 1, "No saved device", SMLSIZE)
       end
@@ -465,11 +479,11 @@ return function(ctx)
       if isEditing then
         local primaryLabel = store.status.bleConnected and "Disconnect" or "Reconnect"
         valStr   = self._savedToggled and "Forget" or primaryLabel
-        valColor = theme.C.text
+        valColor = C_text
       else
         local isConn  = store.status.bleConnected
         valStr   = isConn and "Connected" or "Disconnected"
-        valColor = isConn and theme.C.green or theme.C.red
+        valColor = isConn and C_green or C_red
       end
       drawRow(ry, rowW, focused and not isEditing, isEditing, addr, valStr, valColor)
     end
@@ -483,7 +497,7 @@ return function(ctx)
       self._findList:render()
     else
       -- Idle, scanning, or no results: always show the scan button row
-      drawRow(findRowY, rowW, findFocused, false, "Scan for Devices", "", theme.C.subtext)
+      drawRow(findRowY, rowW, findFocused, false, "Scan for Devices", "", C_subtext)
     end
 
     -- ── Scan timeout (30 s) ───────────────────────────────────────
@@ -501,14 +515,20 @@ return function(ctx)
       end
     end
 
-    -- ── Connection timeout (15 s) ─────────────────────────────────
+    -- ── Operation timeout ─────────────────────────────────────────
     if self._opTick > 0 and self._modal then
       local timedOp = self._opState == OP_CONNECTING
                    or self._opState == OP_CONNECTED_INFO
                    or self._opState == OP_RECONNECTING
                    or self._opState == OP_DISCONNECTING
                    or self._opState == OP_FORGETTING
-      if timedOp and (getTime() - self._opTick) > 1500 then
+      -- Connect/reconnect can legitimately take longer because firmware may
+      -- retry with alternate BLE address type on first attempt.
+      local timeoutTicks = 1500
+      if self._opState == OP_CONNECTING or self._opState == OP_RECONNECTING then
+        timeoutTicks = 2200
+      end
+      if timedOp and (getTime() - self._opTick) > timeoutTicks then
         self._opTick = 0
         self._opState = OP_NONE
         self._modal = Modal.new({

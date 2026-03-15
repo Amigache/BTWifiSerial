@@ -22,6 +22,7 @@ return function(ctx)
   local theme = ctx.theme
   local scale = ctx.scale
 
+  local isColor = theme.isColor
   local PAD = scale.sx(17)
 
   local Section = {}
@@ -40,27 +41,25 @@ return function(ctx)
     self.gapLC       = props.gapLC      or scale.sy(12)  -- line         → content
     self.y           = self.y + (props.marginTop or 0)
 
-    local lineY      = self.y + theme.FH.body + self.gapTL
-    self.contentY    = lineY + 1 + self.gapLC
+    self._lineY      = self.y + theme.FH.body + self.gapTL
+    self.contentY    = self._lineY + 1 + self.gapLC
     self.h           = self.contentY - self.y
+    self._fontCC     = self.font + CUSTOM_COLOR
     return self
   end
 
   function Section:render()
-    if theme.isColor then
+    if isColor then
       -- Title text in accent color
       lcd.setColor(CUSTOM_COLOR, self.titleColor)
-      lcd.drawText(self.x, self.y, self.title, self.font + CUSTOM_COLOR)
+      lcd.drawText(self.x, self.y, self.title, self._fontCC)
 
       -- 1px divider line
-      local lineY = self.y + theme.FH.body + self.gapTL
       lcd.setColor(CUSTOM_COLOR, self.lineColor)
-      lcd.drawFilledRectangle(self.x, lineY, self.w, 1, CUSTOM_COLOR)
+      lcd.drawFilledRectangle(self.x, self._lineY, self.w, 1, CUSTOM_COLOR)
     else
       lcd.drawText(self.x, self.y, self.title, self.font + BOLD)
-      lcd.drawLine(self.x, self.y + theme.FH.body + self.gapTL,
-                   self.x + self.w - 1,
-                   self.y + theme.FH.body + self.gapTL, SOLID, 0)
+      lcd.drawLine(self.x, self._lineY, self.x + self.w - 1, self._lineY, SOLID, 0)
     end
   end
 

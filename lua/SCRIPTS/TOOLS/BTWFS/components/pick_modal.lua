@@ -22,6 +22,29 @@ return function(ctx)
   local Loading = ctx.Loading
   local List    = ctx.List
 
+  -- Cache theme values
+  local isColor    = theme.isColor
+  local C_overlay  = theme.C.overlay
+  local C_header   = theme.C.header
+  local C_panel    = theme.C.panel
+  local C_text     = theme.C.text
+  local C_subtext  = theme.C.subtext
+  local C_accent   = theme.C.accent
+  local F_body     = theme.F.body
+  local F_small    = theme.F.small
+  local F_BODY_CC  = F_body + CUSTOM_COLOR
+  local F_SMALL_CC = F_small + CUSTOM_COLOR
+  local FH_body    = theme.FH.body
+  local FH_small   = theme.FH.small
+
+  -- Pre-compute scale values
+  local SHADOW_OFF = scale.s(4)
+  local SPINNER_GAP = scale.sy(6)
+  local SCANNING_MSG = "Scanning..."
+  local SCANNING_TW  = (lcd.sizeText and lcd.sizeText(SCANNING_MSG, F_small)) or scale.sx(60)
+  local NORESULT_MSG = "No networks found"
+  local NORESULT_TW  = (lcd.sizeText and lcd.sizeText(NORESULT_MSG, F_small)) or scale.sx(100)
+
   local function evEnter(e)
     return (EVT_VIRTUAL_ENTER ~= nil and e == EVT_VIRTUAL_ENTER)
         or (EVT_ENTER_BREAK   ~= nil and e == EVT_ENTER_BREAK)
@@ -62,6 +85,25 @@ return function(ctx)
     local contentH = mh - titleH
     self._contentY0 = contentY
     self._contentH0 = contentH
+
+    -- Pre-compute title text position
+    local ttw = (lcd.sizeText and lcd.sizeText(self._title, F_body)) or scale.sx(100)
+    self._titleTextX = mx + math.floor((mw - ttw) / 2)
+    self._titleTextY = my + math.floor((titleH - FH_body) / 2) - scale.sy(3)
+
+    -- Pre-compute shadow position
+    self._shX = mx + SHADOW_OFF
+    self._shY = my + SHADOW_OFF
+
+    -- Pre-compute empty-state center Y
+    self._emptyCY = contentY + math.floor((contentH - FH_small) / 2)
+    self._emptyTX = mx + math.floor((mw - NORESULT_TW) / 2)
+
+    -- Pre-compute scanning label X
+    self._scanLabelX = mx + math.floor((mw - SCANNING_TW) / 2)
+
+    -- Title bar color
+    self._titleBg = lcd.RGB(0, 80, 160)
 
     -- Loading spinner (position recalculated in render for correct centering)
     self._spinner = Loading.new({
@@ -142,15 +184,15 @@ return function(ctx)
   function PickModal:render()
     if not self._open then return end
 
-    if not theme.isColor then
+    if not isColor then
       -- B&W fallback
       lcd.drawFilledRectangle(self._mx, self._my, self._mw, self._mh, ERASE)
       lcd.drawRectangle(self._mx, self._my, self._mw, self._mh, SOLID)
       lcd.drawText(self._mx + 4, self._my + 4, self._title, BOLD)
       if self._loading then
-        lcd.drawText(self._mx + 4, self._my + 24, "Scanning...", SMLSIZE)
+        lcd.drawText(self._mx + 4, self._my + 24, SCANNING_MSG, SMLSIZE)
       elseif #self._items == 0 then
-        lcd.drawText(self._mx + 4, self._my + 24, "No networks found", SMLSIZE)
+        lcd.drawText(self._mx + 4, self._my + 24, NORESULT_MSG, SMLSIZE)
       else
         self._list:render()
       end
@@ -159,56 +201,43 @@ return function(ctx)
 
     -- Dark overlay
     if self._overlay then
-      lcd.setColor(CUSTOM_COLOR, theme.C.overlay)
+      lcd.setColor(CUSTOM_COLOR, C_overlay)
       lcd.drawFilledRectangle(0, 0, LCD_W, LCD_H, CUSTOM_COLOR)
     end
 
-    -- Drop shadow
-    local sh = scale.s(4)
-    lcd.setColor(CUSTOM_COLOR, theme.C.overlay)
-    lcd.drawFilledRectangle(self._mx + sh, self._my + sh, self._mw, self._mh, CUSTOM_COLOR)
+    -- Drop shadow (pre-computed)
+    lcd.setColor(CUSTOM_COLOR, C_overlay)
+    lcd.drawFilledRectangle(self._shX, self._shY, self._mw, self._mh, CUSTOM_COLOR)
 
     -- Modal background
-    lcd.setColor(CUSTOM_COLOR, theme.C.header)
+    lcd.setColor(CUSTOM_COLOR, C_header)
     lcd.drawFilledRectangle(self._mx, self._my, self._mw, self._mh, CUSTOM_COLOR)
 
     -- Border
-    lcd.setColor(CUSTOM_COLOR, theme.C.panel)
+    lcd.setColor(CUSTOM_COLOR, C_panel)
     lcd.drawRectangle(self._mx, self._my, self._mw, self._mh, CUSTOM_COLOR)
 
     -- Title bar
-    local titleBg = lcd.RGB(0, 80, 160)
-    lcd.setColor(CUSTOM_COLOR, titleBg)
+    lcd.setColor(CUSTOM_COLOR, self._titleBg)
     lcd.drawFilledRectangle(self._mx, self._my, self._mw, self._titleH, CUSTOM_COLOR)
-    lcd.setColor(CUSTOM_COLOR, theme.C.text)
-    local ttw = (lcd.sizeText and lcd.sizeText(self._title, theme.F.body)) or scale.sx(100)
-    local ty = self._my + math.floor((self._titleH - theme.FH.body) / 2) - scale.sy(3)
-    lcd.drawText(self._mx + math.floor((self._mw - ttw) / 2), ty,
-                 self._title, theme.F.body + CUSTOM_COLOR)
+    lcd.setColor(CUSTOM_COLOR, C_text)
+    lcd.drawText(self._titleTextX, self._titleTextY, self._title, F_BODY_CC)
 
     -- Content area
     if self._loading then
       -- Center spinner + label as a group vertically in content area
-      local r   = self._spinner.r
-      local gap = scale.sy(6)
-      local msg = "Scanning..."
-      local tw  = (lcd.sizeText and lcd.sizeText(msg, theme.F.small)) or scale.sx(60)
-      local groupH = r * 2 + gap + theme.FH.small
+      local r      = self._spinner.r
+      local groupH = r * 2 + SPINNER_GAP + FH_small
       local spinCy = self._contentY0 + math.floor((self._contentH0 - groupH) / 2) + r
       self._spinner.cx = self._mx + math.floor(self._mw / 2)
       self._spinner.cy = spinCy
       self._spinner:render()
-      lcd.setColor(CUSTOM_COLOR, theme.C.subtext)
-      lcd.drawText(self._mx + math.floor((self._mw - tw) / 2),
-                   spinCy + r + gap, msg, theme.F.small + CUSTOM_COLOR)
+      lcd.setColor(CUSTOM_COLOR, C_subtext)
+      lcd.drawText(self._scanLabelX, spinCy + r + SPINNER_GAP, SCANNING_MSG, F_SMALL_CC)
 
     elseif #self._items == 0 then
-      local cy = self._contentY0 + math.floor((self._contentH0 - theme.FH.small) / 2)
-      lcd.setColor(CUSTOM_COLOR, theme.C.subtext)
-      local msg = "No networks found"
-      local nrW = (lcd.sizeText and lcd.sizeText(msg, theme.F.small)) or scale.sx(100)
-      lcd.drawText(self._mx + math.floor((self._mw - nrW) / 2), cy,
-                   msg, theme.F.small + CUSTOM_COLOR)
+      lcd.setColor(CUSTOM_COLOR, C_subtext)
+      lcd.drawText(self._emptyTX, self._emptyCY, NORESULT_MSG, F_SMALL_CC)
 
     else
       self._list:render()

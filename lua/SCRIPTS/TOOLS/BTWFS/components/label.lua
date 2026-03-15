@@ -15,6 +15,7 @@
 
 return function(ctx)
   local theme = ctx.theme
+  local isColor = theme.isColor
 
   local Label = {}
   Label.__index = Label
@@ -27,6 +28,7 @@ return function(ctx)
     self.font   = props.font  or theme.F.body
     self.color  = props.color or theme.C.text
     self.flags  = props.flags or 0
+    self._drawFlags = self.font + self.flags
     return self
   end
 
@@ -36,12 +38,11 @@ return function(ctx)
   function Label:setColor(c) self.color = c ; return self end
 
   function Label:render()
-    local flags = self.font + self.flags
-    if theme.isColor then
+    if isColor then
       lcd.setColor(CUSTOM_COLOR, self.color)
-      lcd.drawText(self.x, self.y, self.text, flags + CUSTOM_COLOR)
+      lcd.drawText(self.x, self.y, self.text, self._drawFlags + CUSTOM_COLOR)
     else
-      lcd.drawText(self.x, self.y, self.text, flags)
+      lcd.drawText(self.x, self.y, self.text, self._drawFlags)
     end
   end
 

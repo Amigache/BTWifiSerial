@@ -25,6 +25,11 @@ return function(ctx)
   local theme = ctx.theme
   local scale = ctx.scale
 
+  -- Cache theme values as locals
+  local isColor    = theme.isColor
+  local F_small    = theme.F.small
+  local F_SMALL_CC = F_small + CUSTOM_COLOR
+
   local ChannelBar = {}
   ChannelBar.__index = ChannelBar
 
@@ -54,55 +59,63 @@ return function(ctx)
     self._barOff  = math.floor((self.h - self.barH) / 2)
     self._txtOff  = math.floor((self.h - theme.FH.small) / 2) - scale.sy(3)
     self._centerW = math.max(1, scale.sx(2))
+    self._cx      = self._barX + math.floor(self._barW / 2)
+    self._halfW   = math.floor(self._barW / 2)
+    self._maxFillW = self._halfW - self._centerW  -- constant limit for fill width
+    self._pctStr  = "0%"
+    self._norm    = 0
+
+    -- Pre-compute immutable derived positions
+    self._by = self.y + self._barOff
+    self._ty = self.y + self._txtOff
 
     return self
   end
 
   function ChannelBar:setValue(v)
+    if v == self.value then return end
     self.value = v
+
+    -- Recompute cached derived values only when value changes
+    local range = self.max - self.min
+    if range > 0 then
+      self._pctStr = math.floor((v - self.min) / range * 200 - 100 + 0.5) .. "%"
+      self._norm   = (v - self.min) / range * 2 - 1
+    else
+      self._pctStr = "0%"
+      self._norm   = 0
+    end
   end
 
   function ChannelBar:render()
-    local v   = self.value
-    local by  = self.y + self._barOff
-    local ty  = self.y + self._txtOff
+    local by  = self._by
+    local ty  = self._ty
     local bw  = self._barW
     local bx  = self._barX
     local bh  = self.barH
 
-    -- Percentage: map value from [min..max] to [-100..+100]
-    local range = self.max - self.min
-    local pct = 0
-    if range > 0 then
-      pct = math.floor((v - self.min) / range * 200 - 100 + 0.5)
-    end
-
-    if theme.isColor then
-      -- Left label
+    if isColor then
+      -- Batch text draws: label + pct (same textColor) → one setColor
       lcd.setColor(CUSTOM_COLOR, self.textColor)
-      lcd.drawText(self.x, ty, self.label, theme.F.small + CUSTOM_COLOR)
+      lcd.drawText(self.x, ty, self.label, F_SMALL_CC)
+      lcd.drawText(self._pctX, ty, self._pctStr, F_SMALL_CC)
 
       -- Bar background
       lcd.setColor(CUSTOM_COLOR, self.bgColor)
       lcd.drawFilledRectangle(bx, by, bw, bh, CUSTOM_COLOR)
 
       -- Center line
-      local cx = bx + math.floor(bw / 2)
+      local cx = self._cx
       lcd.setColor(CUSTOM_COLOR, self.centerColor)
       lcd.drawFilledRectangle(cx, by, self._centerW, bh, CUSTOM_COLOR)
 
       -- Value fill (from center)
-      local halfW = math.floor(bw / 2)
-      -- Normalise v into -1..+1 range
-      local norm = 0
-      if range > 0 then
-        norm = (v - self.min) / range * 2 - 1  -- -1 to +1
-      end
+      local halfW = self._halfW
+      local norm  = self._norm
 
       lcd.setColor(CUSTOM_COLOR, self.barColor)
       if norm > 0 then
-        local maxFw = halfW - self._centerW
-        local fw = math.min(math.floor(norm * halfW), maxFw)
+        local fw = math.min(math.floor(norm * halfW), self._maxFillW)
         if fw > 0 then
           lcd.drawFilledRectangle(cx + self._centerW, by, fw, bh, CUSTOM_COLOR)
         end
@@ -112,14 +125,10 @@ return function(ctx)
           lcd.drawFilledRectangle(cx - fw, by, fw, bh, CUSTOM_COLOR)
         end
       end
-
-      -- Percentage text
-      lcd.setColor(CUSTOM_COLOR, self.textColor)
-      lcd.drawText(self._pctX, ty, pct .. "%", theme.F.small + CUSTOM_COLOR)
     else
       -- B&W fallback: just text
-      lcd.drawText(self.x, ty, self.label, theme.F.small)
-      lcd.drawText(self._pctX, ty, pct .. "%", theme.F.small)
+      lcd.drawText(self.x, ty, self.label, F_small)
+      lcd.drawText(self._pctX, ty, self._pctStr, F_small)
     end
   end
 

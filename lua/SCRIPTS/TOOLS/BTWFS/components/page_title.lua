@@ -16,8 +16,25 @@ return function(ctx)
   local theme = ctx.theme
   local scale = ctx.scale
 
+  -- Cache theme values
+  local isColor = theme.isColor
+
+  -- Pre-compute B&W padding (avoid per-frame scale calls)
+  local BW_PAD_X = scale.sx(4)
+  local BW_PAD_Y = scale.sy(4)
+
   local PageTitle = {}
   PageTitle.__index = PageTitle
+
+  local function computeTextPos(self)
+    if lcd.sizeText then
+      local tw = lcd.sizeText(self.text, self.font)
+      self._tx = self.x + ((tw > 0) and math.floor((self.w - tw) / 2) or scale.sx(15))
+    else
+      self._tx = self.x + scale.sx(15)
+    end
+    self._ty = self.y + math.floor((self.h - theme.FH.body) / 2) - scale.sy(4)
+  end
 
   function PageTitle.new(props)
     local self    = setmetatable({}, PageTitle)
@@ -29,35 +46,30 @@ return function(ctx)
     self.bgColor  = props.bgColor or theme.C.panel
     self.color    = props.color   or theme.C.text
     self.font     = props.font    or theme.F.body
+    self._fontCC  = self.font + CUSTOM_COLOR
+    computeTextPos(self)
     return self
   end
 
   function PageTitle:setText(t)
     self.text = string.upper(t)
+    computeTextPos(self)
     return self
   end
 
   function PageTitle:render()
     -- Background band
-    if theme.isColor then
+    if isColor then
       lcd.setColor(CUSTOM_COLOR, self.bgColor)
       lcd.drawFilledRectangle(self.x, self.y, self.w, self.h, CUSTOM_COLOR)
     else
-      -- B&W: just draw the text, no fill
-      lcd.drawText(self.x + scale.sx(4), self.y + scale.sy(4), self.text, self.font + BOLD)
+      -- B&W: just draw the text, no fill (padding pre-computed)
+      lcd.drawText(self.x + BW_PAD_X, self.y + BW_PAD_Y, self.text, self.font + BOLD)
       return
     end
 
-    -- Centered text.
-    -- The -scale.sy(3) is an empirical correction: EdgeTX body glyphs
-    -- have internal leading that shifts them visually below the true bbox top.
-    local tw = (lcd.sizeText and lcd.sizeText(self.text, self.font)) or 0
-    local tx = (tw > 0) and math.floor((self.w - tw) / 2) or scale.sx(15)
-    local textH = theme.FH.body
-    local ty    = self.y + math.floor((self.h - textH) / 2) - scale.sy(4)
-
     lcd.setColor(CUSTOM_COLOR, self.color)
-    lcd.drawText(self.x + tx, ty, self.text, self.font + CUSTOM_COLOR)
+    lcd.drawText(self._tx, self._ty, self.text, self._fontCC)
   end
 
   return PageTitle

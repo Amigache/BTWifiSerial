@@ -206,35 +206,102 @@ end
 -- ── Initial data request (retried until prefs arrive) ─────────────
 local _initTick  = 0
 local _initDone  = false
+local _prefsReady = false
+local _infoReady  = false
+local _prefsTick   = 0
 
 -- ── Connection / boot state ────────────────────────────────────────
 local CONN_TIMEOUT      = 800   -- ticks (≈ 8 s, 1 tick = 10 ms)
 local DISCONNECT_TIMEOUT = 300   -- ticks (≈ 3 s)
+local INIT_INFO_GRACE   = 180   -- ticks (≈ 1.8 s after prefs_ready)
 local _connState     = "idle"
 local _connStartTick = 0
 local _connModal     = nil
 
+-- ── BG script warning ────────────────────────────────────────────
+local PREF_DEV_MODE  = 0x02  -- ENUM: 0=Trainer IN, 1=Trainer OUT, 2=Telemetry
+local PREF_TELEM_OUT = 0x03  -- ENUM: 0=WiFi UDP, 1=BLE, 2=None
+local _bgWarnModal = nil
+local _bgWarnShown = false
+
+local function _bgScriptNeeded()
+  if (ctx.sfSlot or 0) ~= 0 then return false end
+  local dm  = store.prefs[PREF_DEV_MODE]
+  local tel = store.prefs[PREF_TELEM_OUT]
+  local dmIdx  = dm  and dm.curIdx  or 0
+  local telIdx = tel and tel.curIdx or 2
+  return dmIdx == 0
+      or dmIdx == 1
+      or (dmIdx == 2 and telIdx ~= 2)
+end
+
+local function _checkBgScriptWarning()
+  if _bgWarnShown then return end
+  _bgWarnShown = true
+  if not _bgScriptNeeded() then return end
+  local dm  = store.prefs[PREF_DEV_MODE]
+  local dmIdx = dm and dm.curIdx or 0
+  local modeNames = { [0]="Trainer IN", [1]="Trainer OUT", [2]="Telemetry" }
+  local modeName  = modeNames[dmIdx] or "Current"
+  _bgWarnModal = Modal.new({
+    type     = "alert",
+    severity = "warning",
+    title    = "BG Script Missing",
+    message  = modeName .. " mode needs the\nbtwfs background script.",
+    onClose  = function() _bgWarnModal = nil end,
+  })
+  _bgWarnModal:show()
+end
+
+local function _onReady()
+  _connState = "ready"
+  _connModal = nil
+  _updateDotBoard(true)
+  _checkBgScriptWarning()
+end
+
 local function requestInitialData()
-  if _initDone then return end
+  if _prefsReady and _infoReady then
+    _initDone = true
+    return
+  end
   if not serialWrite then return end
   local now = getTime()
   if now - _initTick < 200 then return end   -- retry every 2 s
   _initTick = now
+  -- INFO_REQUEST already returns prefs + info + status from the ESP32.
+  -- Sending an extra PREF_REQUEST duplicates the largest burst and can delay
+  -- or starve INFO completion on the radio side.
   serialWrite(proto.buildInfoRequest())
-  serialWrite(proto.buildPrefRequest())
 end
 
 store.on("prefs_ready", function()
-  _initDone = true
-  if _connState == "connecting" or _connState == "disconnected" then
-    _connState = "ready"
-    _connModal = nil
-    _updateDotBoard(true)
+  _prefsReady = true
+  _prefsTick = getTime()
+  _initDone = _prefsReady and _infoReady
+  if _initDone and (_connState == "connecting" or _connState == "disconnected") then
+    _onReady()
   end
 end)
 
--- ── Shared-memory heartbeat slot (used by btwfs.lua) ──────────────
-local SHM_TOOLS_HB = 1
+store.on("info_ready", function()
+  _infoReady = true
+  _initDone = _prefsReady and _infoReady
+  if _initDone and (_connState == "connecting" or _connState == "disconnected") then
+    _onReady()
+  end
+end)
+
+-- Re-evaluate BG script warning when Device Mode or Telem Out changes.
+store.on("pref_changed", function(pref)
+  if (pref.id == PREF_DEV_MODE or pref.id == PREF_TELEM_OUT)
+    and _connState == "ready" then
+    _bgWarnShown = false
+    if _bgWarnModal then _bgWarnModal:close(); _bgWarnModal = nil end
+  end
+end)
+
+local SHM_TOOLS_HB = 1   -- slot written by Tools script; read by btwfs.lua
 local function updateShmHeartbeat()
   if setShmVar then setShmVar(SHM_TOOLS_HB, getTime()) end
 end
@@ -254,11 +321,50 @@ local function navigateTo(idx)
   currentPage():setPagination(pageIdx, #pages)
 end
 
+-- ── Background script SF auto-setup ──────────────────────────────
+-- Scans the model's Special Functions for an existing btwfs slot.
+-- If not found, creates one in the first free slot.
+-- Result stored in ctx.sfSlot (1-based slot number, or 0 = failed).
+local BG_SCRIPT_NAME = "btwfs"
+
+-- ── Background script SF detection ──────────────────────────────
+-- Scans the model's Special Functions for an existing btwfs slot.
+-- Writing model SFs from a TOOLS script is not reliably supported by
+-- EdgeTX — the scan detects an existing manual setup only.
+-- Result stored in ctx.sfSlot:
+--   nil  = model API unavailable
+--   0    = not found (user must set it up manually)
+--   N>0  = found at slot N (1-based, i.e. SF1, SF2, …)
+local BG_SCRIPT_NAME = "btwfs"
+
+local function ensureBgScript()
+  ctx.sfSlot = 0  -- default: not found
+  if not (model and model.getCustomFunction) then
+    ctx.sfSlot = nil  -- API unavailable
+    return
+  end
+  if not FUNC_PLAY_SCRIPT then return end
+  for i = 0, 63 do
+    local cf = model.getCustomFunction(i)
+    if cf and cf.func == FUNC_PLAY_SCRIPT and cf.name == BG_SCRIPT_NAME then
+      ctx.sfSlot = i + 1   -- 1-based (SF1, SF2, …)
+      return
+    end
+  end
+  -- Not found — user must add it manually in Special Functions:
+  -- Switch: ON  →  Lua Script  →  btwfs
+end
+
 local function init()
   _initDone    = false
+  _prefsReady  = false
+  _infoReady   = false
+  _prefsTick   = 0
   _initTick    = 0
   _lastHbTick  = 0
-  _lastRxTick  = getTime()   -- start fresh so disconnect check doesn't fire immediately
+  _lastRxTick  = getTime()
+  _bgWarnShown = false
+  _bgWarnModal = nil
   store.reset()
   -- Start in connecting state: spinner shown until prefs arrive or timeout
   _connState     = "connecting"
@@ -270,6 +376,7 @@ local function init()
     message  = "Communicating with device...",
   })
   _connModal:show()
+  ensureBgScript()
   pages[1] = Dashboard.new()
   pages[2] = Settings.new()
   pages[3] = Bluetooth.new()
@@ -286,6 +393,10 @@ local function run(event, touchState)
 
   -- ── Connection gate ──────────────────────────────────────────────
   if _connState == "connecting" then
+    if _prefsReady and (_infoReady or (getTime() - _prefsTick >= INIT_INFO_GRACE)) then
+      _initDone = _prefsReady and _infoReady
+      _onReady()
+    end
     if getTime() - _connStartTick >= CONN_TIMEOUT then
       -- Timeout reached: swap spinner for error alert
       _connState = "timeout"
@@ -335,6 +446,9 @@ local function run(event, touchState)
   if _connState == "ready" and getTime() - _lastRxTick >= DISCONNECT_TIMEOUT then
     _connState    = "disconnected"
     _initDone     = false
+    _prefsReady   = false
+    _infoReady    = false
+    _prefsTick    = 0
     _initTick     = 0
     store.reset()
     _updateDotBoard(false)
@@ -345,6 +459,11 @@ local function run(event, touchState)
       message  = "Waiting for device...",
     })
     _connModal:show()
+  end
+
+  -- Check BG script warning once per session (deferred until "ready")
+  if not _bgWarnShown and _connState == "ready" then
+    _checkBgScriptWarning()
   end
 
   -- Page-button navigation (consume event before passing to page)
@@ -359,10 +478,20 @@ local function run(event, touchState)
   -- Delegate remaining events to the current page (if it handles them)
   local pg = currentPage()
   if event ~= 0 and pg.handleEvent then
-    pg:handleEvent(event)
+    if not (_bgWarnModal and _bgWarnModal:isOpen()) then
+      pg:handleEvent(event)
+    end
   end
 
   pg:render()
+
+  -- BG script warning modal renders on top of everything
+  local bgm = _bgWarnModal
+  if bgm and bgm:isOpen() then
+    bgm:handleEvent(event)
+    if bgm:isOpen() then bgm:render() end
+  end
+
   return 0
 end
 
