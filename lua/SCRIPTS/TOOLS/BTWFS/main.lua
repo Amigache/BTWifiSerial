@@ -6,6 +6,11 @@
 -- BTWFS scripts live at /SCRIPTS/TOOLS/BTWFS/
 local BASE = "/SCRIPTS/TOOLS/BTWFS"
 
+-- ── Debug flag ────────────────────────────────────────────────────
+-- Set true to display page render time (in 10 ms ticks) in the top-right corner.
+-- Keep false in production — it adds an extra getTime() call and text draw per frame.
+local DEBUG_TIMING = false
+
 -- ── Load shared libs ───────────────────────────────────────────────
 local scale = loadScript(BASE .. "/lib/scale.lua")()
 local theme = loadScript(BASE .. "/lib/theme.lua")()
@@ -321,12 +326,6 @@ local function navigateTo(idx)
   currentPage():setPagination(pageIdx, #pages)
 end
 
--- ── Background script SF auto-setup ──────────────────────────────
--- Scans the model's Special Functions for an existing btwfs slot.
--- If not found, creates one in the first free slot.
--- Result stored in ctx.sfSlot (1-based slot number, or 0 = failed).
-local BG_SCRIPT_NAME = "btwfs"
-
 -- ── Background script SF detection ──────────────────────────────
 -- Scans the model's Special Functions for an existing btwfs slot.
 -- Writing model SFs from a TOOLS script is not reliably supported by
@@ -483,7 +482,14 @@ local function run(event, touchState)
     end
   end
 
-  pg:render()
+  if DEBUG_TIMING then
+    local _t0 = getTime()
+    pg:render()
+    local _dt = getTime() - _t0
+    lcd.drawText(scale.W - scale.sx(50), 0, "T:" .. _dt, SMLSIZE)
+  else
+    pg:render()
+  end
 
   -- BG script warning modal renders on top of everything
   local bgm = _bgWarnModal

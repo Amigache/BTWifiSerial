@@ -67,6 +67,15 @@ return function(ctx)
     return nil
   end
 
+  -- ── Helper: read local BT address from info store ─────────────────
+  local function localAddr()
+    local inf = store.info[proto.INFO_BT_ADDR]
+    if inf and inf.value and inf.value ~= "" and inf.value ~= "?" then
+      return inf.value
+    end
+    return nil
+  end
+
   -- ── Helper: build scan-results rows for the List component ────────
   local function buildScanRows()
     local rows = {}
@@ -132,9 +141,10 @@ return function(ctx)
     local savedSecY       = contentY + gap
     self._savedSection    = Section.new({ title = "Saved Device", y = savedSecY })
     self._savedRowY       = self._savedSection.contentY
+    self._localAddrRowY   = self._savedRowY + rowH   -- read-only local BT addr row
 
     -- ── Section 2: Find Devices ───────────────────────────────────
-    local findSecY        = self._savedRowY + rowH + gap
+    local findSecY        = self._localAddrRowY + rowH + gap
     self._findSection     = Section.new({ title = "Find Devices", y = findSecY, marginTop = scale.sy(8) })
     local findListY       = self._findSection.contentY
     local findListH       = (contentY + contentH) - findListY
@@ -243,6 +253,7 @@ return function(ctx)
 
     store.on("info_changed", function(inf)
       if inf.id == proto.INFO_REM_ADDR then onRemoteAddrUpdate() end
+      -- INFO_BT_ADDR: no layout change needed, render reads localAddr() live
     end)
 
     -- Initial info dump uses addInfo (no info_changed), so also listen for info_ready
@@ -487,6 +498,10 @@ return function(ctx)
       end
       drawRow(ry, rowW, focused and not isEditing, isEditing, addr, valStr, valColor)
     end
+
+    -- ── Local BT Address row (read-only, always rendered) ────────
+    local la = localAddr() or "--"
+    drawRow(self._localAddrRowY, rowW, false, false, "Local Address", la, nil)
 
     -- ── Find Devices content ──────────────────────────────────────
     local findFocused = (self._focus == 1)

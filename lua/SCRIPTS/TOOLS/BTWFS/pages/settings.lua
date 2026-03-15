@@ -362,14 +362,15 @@ return function(ctx)
       chars[#chars + 1] = #cs + 1
     end
     self._textEdit = {
-      prefId  = id,
-      title   = p.label or "Edit",
-      maxLen  = maxLen,
-      charset = cs,
-      csLen   = #cs,
-      chars   = chars,
-      upper   = upper,
-      cursor  = 1,
+      prefId         = id,
+      title          = p.label or "Edit",
+      maxLen         = maxLen,
+      charset        = cs,
+      csLen          = #cs,
+      chars          = chars,
+      upper          = upper,
+      cursor         = 1,
+      _teRenderCache = nil,   -- cached render strings; nil = dirty
     }
   end
 
@@ -399,6 +400,7 @@ return function(ctx)
   -- Handle events while text editor is active.
   function Settings:_handleTextEdit(event)
     local te = self._textEdit
+    te._teRenderCache = nil   -- any event may change visible state; rebuild on next render
     local cs    = te.charset
     local csLen = te.csLen
     if evEnterLong(event) then
@@ -504,41 +506,54 @@ return function(ctx)
       lcd.drawText(titleX, my + scale.sy(4), title, SMLSIZE + BOLD)
     end
 
-    local pre = ""
-    for i = 1, te.cursor - 1 do
-      local ch = resolveChar(te, i)
-      if ch then pre = pre .. ch end
-    end
-    local ci = te.chars[te.cursor]
-    local isEnd = (ci == nil or ci > te.csLen)
-    local curCh = isEnd and " " or (resolveChar(te, te.cursor) or " ")
-    local post = ""
-    for i = te.cursor + 1, #te.chars do
-      local ch = resolveChar(te, i)
-      if ch then post = post .. ch end
-    end
-
     local rowY = my + th + scale.sy(40)
     local font = F_small
-    local allTxt = pre .. curCh .. post
-    local allW = (lcd.sizeText and lcd.sizeText(allTxt, font)) or (#allTxt * 8)
-    local sx = mx + math.floor((mw - allW) / 2)
+
+    -- Rebuild render cache only when dirty (invalidated by _handleTextEdit on any event).
+    -- This avoids 3 lcd.sizeText() calls + string building on no-input frames.
+    if not te._teRenderCache then
+      local pre = ""
+      for i = 1, te.cursor - 1 do
+        local ch = resolveChar(te, i)
+        if ch then pre = pre .. ch end
+      end
+      local ci = te.chars[te.cursor]
+      local isEnd = (ci == nil or ci > te.csLen)
+      local curCh = isEnd and " " or (resolveChar(te, te.cursor) or " ")
+      local post = ""
+      for i = te.cursor + 1, #te.chars do
+        local ch = resolveChar(te, i)
+        if ch then post = post .. ch end
+      end
+      local allTxt = pre .. curCh .. post
+      local allW = (lcd.sizeText and lcd.sizeText(allTxt, font)) or (#allTxt * 8)
+      local preW
+      if pre ~= "" then
+        preW = (lcd.sizeText and lcd.sizeText(pre, font)) or (#pre * 8)
+      else
+        preW = 0
+      end
+      local curW = (lcd.sizeText and lcd.sizeText(curCh, font)) or 8
+      te._teRenderCache = {
+        pre = pre, curCh = curCh, post = post,
+        isEnd = isEnd, allW = allW, preW = preW, curW = curW,
+      }
+    end
+    local c = te._teRenderCache
+    local sx = mx + math.floor((mw - c.allW) / 2)
 
     if isColor then lcd.setColor(CUSTOM_COLOR, C_text) end
     local colFlag = isColor and CUSTOM_COLOR or 0
-    local preW = 0
-    if pre ~= "" then
-      lcd.drawText(sx, rowY, pre, font + colFlag)
-      preW = (lcd.sizeText and lcd.sizeText(pre, font)) or (#pre * 8)
+    if c.pre ~= "" then
+      lcd.drawText(sx, rowY, c.pre, font + colFlag)
     end
-    lcd.drawText(sx + preW, rowY, curCh, font + colFlag)
-    local curW = (lcd.sizeText and lcd.sizeText(curCh, font)) or 8
-    if post ~= "" then
-      lcd.drawText(sx + preW + curW, rowY, post, font + colFlag)
+    lcd.drawText(sx + c.preW, rowY, c.curCh, font + colFlag)
+    if c.post ~= "" then
+      lcd.drawText(sx + c.preW + c.curW, rowY, c.post, font + colFlag)
     end
 
     local caretY = rowY + theme.FH.small + scale.sy(2)
-    lcd.drawText(sx + preW, caretY, "_", font + BLINK + colFlag)
+    lcd.drawText(sx + c.preW, caretY, "_", font + BLINK + colFlag)
   end
 
 
@@ -629,12 +644,11 @@ return function(ctx)
       if getTime() - self._wifiConnCheckT > 200 then
         self._wifiConnCheckT = nil
         local wmp = store.prefs[0x01]
-      if self._pendingRestartWifiCheck then
-        self._pendingRestartWifiCheck = false
-        self._wifiConnCheck  = true
-        self._wifiConnCheckT = getTime()
-      end
-        if (wmp and wmp.curIdx == 2) and not store.status.wifiClients then
+        if self._pendingRestartWifiCheck then
+          -- Device just restarted; give it another 2 s before checking STA status.
+          self._pendingRestartWifiCheck = false
+          self._wifiConnCheckT = getTime()
+        elseif (wmp and wmp.curIdx == 2) and not store.status.wifiClients then
           self._modal = Modal.new({
             type = "alert", severity = "warning",
             title = "Connection Failed",

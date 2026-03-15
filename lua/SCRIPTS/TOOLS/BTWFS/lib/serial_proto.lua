@@ -400,7 +400,11 @@ function M.newParser(onFrame)
   -- States: 0=wait-sync  1=ch  2=type  3=len  4=accumulate  5=crc
   local st     = 0
   local ch, typ, needed
+  -- Reuse a single buffer table across frames to avoid per-frame GC pressure.
+  -- Entries beyond the new frame length are nilled before accumulation so that
+  -- #buf always equals the actual payload length delivered to onFrame.
   local buf    = {}
+  local bufLen = 0
   local crcAcc = 0
 
   return function(b)
@@ -414,12 +418,17 @@ function M.newParser(onFrame)
       typ = b; crcAcc = bit32.bxor(crcAcc, b); st = 3
 
     elseif st == 3 then
-      needed = b; crcAcc = bit32.bxor(crcAcc, b)
-      buf = {}
+      local newLen = b
+      crcAcc = bit32.bxor(crcAcc, newLen)
+      -- Trim leftover entries from a longer previous frame so #buf == newLen.
+      for i = newLen + 1, bufLen do buf[i] = nil end
+      bufLen = 0
+      needed = newLen
       st = (needed == 0) and 5 or 4
 
     elseif st == 4 then
-      buf[#buf + 1] = b
+      bufLen = bufLen + 1
+      buf[bufLen] = b
       crcAcc = bit32.bxor(crcAcc, b)
       needed = needed - 1
       if needed == 0 then st = 5 end

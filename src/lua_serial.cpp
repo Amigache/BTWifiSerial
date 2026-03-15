@@ -57,7 +57,7 @@ static uint8_t  s_rxState  = 0;
 static uint8_t  s_rxCh     = 0;
 static uint8_t  s_rxType   = 0;
 static uint8_t  s_rxLen    = 0;
-static uint8_t  s_rxBuf[48];   // max incoming payload (PREF_SET STRING: 1+1+1+15+padding)
+static uint8_t  s_rxBuf[80];   // max incoming payload: PREF_SET STA_PASS = 1+1+1+63 = 66 bytes
 static uint8_t  s_rxPos    = 0;
 static uint8_t  s_rxCrcAcc = 0;
 
@@ -293,8 +293,11 @@ static void makeWifiIpText(char* out, size_t outSize) {
     if (s_apMode == 1 || s_apMode == 2) {
         IPAddress ip = WiFi.softAPIP();
         String s = ip.toString();
-        strlcpy(out, s.c_str(), outSize);
-        if (out[0] == '\0') strlcpy(out, "(none)", outSize);
+        if (s.length() > 0 && s != "0.0.0.0") {
+            snprintf(out, outSize, "%s (STATIC)", s.c_str());
+        } else {
+            strlcpy(out, "(none)", outSize);
+        }
         return;
     }
 
@@ -302,8 +305,11 @@ static void makeWifiIpText(char* out, size_t outSize) {
         if (WiFi.isConnected()) {
             IPAddress ip = WiFi.localIP();
             String s = ip.toString();
-            strlcpy(out, s.c_str(), outSize);
-            if (out[0] == '\0') strlcpy(out, "(none)", outSize);
+            if (s.length() > 0 && s != "0.0.0.0") {
+                snprintf(out, outSize, "%s (DHCP)", s.c_str());
+            } else {
+                strlcpy(out, "(none)", outSize);
+            }
         } else {
             strlcpy(out, "(none)", outSize);
         }
@@ -333,7 +339,10 @@ static void sendInfoItem(uint8_t id) {
         case LUA_INFO_BT_ADDR: {
             label = "BT Addr";
             const char* addr = bleGetLocalAddress();
-            strlcpy(val, addr ? addr : "?", sizeof(val));
+            // Fall back to the cached address persisted from the last BLE init.
+            // This ensures the field is populated even before BLE finishes starting.
+            if (!addr || addr[0] == '\0') addr = g_config.localBtAddr;
+            strlcpy(val, (addr && addr[0]) ? addr : "?", sizeof(val));
             break;
         }
         case LUA_INFO_REM_ADDR: {
@@ -378,7 +387,8 @@ static void sendInfoUpdate(uint8_t id) {
             break;
         case LUA_INFO_BT_ADDR: {
             const char* addr = bleGetLocalAddress();
-            strlcpy(val, addr ? addr : "?", sizeof(val));
+            if (!addr || addr[0] == '\0') addr = g_config.localBtAddr;
+            strlcpy(val, (addr && addr[0]) ? addr : "?", sizeof(val));
             break;
         }
         case LUA_INFO_REM_ADDR:
@@ -803,7 +813,13 @@ static void processRxByte(uint8_t b) {
             s_rxLen    = b;
             s_rxCrcAcc ^= b;
             s_rxPos    = 0;
-            s_rxState  = (s_rxLen == 0) ? 5 : 4;
+            if (s_rxLen > sizeof(s_rxBuf)) {
+                LOG_W("LUA", "RX oversized LEN=%u (max %u), frame dropped",
+                      s_rxLen, (unsigned)sizeof(s_rxBuf));
+                s_rxState = 0;
+            } else {
+                s_rxState = (s_rxLen == 0) ? 5 : 4;
+            }
             break;
 
         case 4:  // accumulate payload
