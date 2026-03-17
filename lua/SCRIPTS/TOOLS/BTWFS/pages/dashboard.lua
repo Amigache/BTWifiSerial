@@ -19,6 +19,17 @@ return function(ctx)
   -- Build system list rows from PF_DASHBOARD prefs + info items.
   local function buildSysRows()
     local rows = {}
+    -- Background script slot (detected by ensureBgScript in main.lua)
+    local sfSlot = ctx.sfSlot
+    local sfVal
+    if sfSlot == nil then
+      sfVal = "N/A"          -- model API not available on this EdgeTX build
+    elseif sfSlot == 0 then
+      sfVal = "! Setup needed" -- not found: user must add SF manually
+    else
+      sfVal = "SF" .. sfSlot  -- e.g. "SF3"
+    end
+    rows[#rows + 1] = { label = "BG Script", value = sfVal }
     -- Prefs flagged for dashboard display
     for _, id in ipairs(store.prefsOrder) do
       local p = store.prefs[id]

@@ -34,6 +34,23 @@ return function(ctx)
   local Button  = ctx.Button
   local Loading = ctx.Loading
 
+  -- Cache theme values
+  local isColor    = theme.isColor
+  local C_overlay  = theme.C.overlay
+  local C_header   = theme.C.header
+  local C_panel    = theme.C.panel
+  local C_subtext  = theme.C.subtext
+  local F_small    = theme.F.small
+  local F_SMALL_CC = F_small + CUSTOM_COLOR
+  local FH_small   = theme.FH.small
+
+  -- Pre-compute scale values used in render
+  local SHADOW_OFF = scale.s(4)
+  local LINE_GAP   = scale.sy(4)
+  local MSG_GAP    = scale.sy(10)
+  local BTN_ZONE_INFO  = scale.sy(50) + scale.s(20)
+  local BTN_ZONE_OTHER = scale.sy(32) + scale.sy(16)
+
   -- Severity → color mapping
   local SEV_COLORS = {
     success = theme.C.modalSuccess,
@@ -133,6 +150,49 @@ return function(ctx)
       })
     end
 
+    -- Pre-compute all vertical layout for render (immutable after construction)
+    local titleFont = (self._type == "confirm") and theme.F.body or theme.F.title
+    local titleFH   = (self._type == "confirm") and theme.FH.body or theme.FH.title
+    self._titleFont   = titleFont
+    self._titleFontCC = titleFont + CUSTOM_COLOR
+
+    local accentBot = self._my + self._accentH
+    local hasMsg = #self._lines > 0 and self._type ~= "confirm"
+    self._hasMsg = hasMsg
+
+    local textBlockH = titleFH
+    if hasMsg then
+      textBlockH = textBlockH + MSG_GAP + FH_small * #self._lines + LINE_GAP * (#self._lines - 1)
+    end
+
+    local btnTop
+    if self._type == "info" then
+      btnTop = self._my + self._mh - BTN_ZONE_INFO
+    else
+      btnTop = self._my + self._mh - BTN_ZONE_OTHER
+    end
+    local zoneH = btnTop - accentBot
+    local titleY = accentBot + math.floor((zoneH - textBlockH) / 2)
+    self._titleY = titleY
+
+    -- Title X (centered)
+    local tw = lcd.sizeText and lcd.sizeText(self._title, titleFont) or 0
+    self._titleX = self._mx + math.floor((self._mw - tw) / 2)
+
+    -- Message line positions (pre-compute X for each line)
+    if hasMsg then
+      self._lineY0 = titleY + titleFH + MSG_GAP
+      self._lineXs = {}
+      for i, line in ipairs(self._lines) do
+        local lw = lcd.sizeText and lcd.sizeText(line, F_small) or 0
+        self._lineXs[i] = self._mx + math.floor((self._mw - lw) / 2)
+      end
+    end
+
+    -- Shadow position
+    self._shX = self._mx + SHADOW_OFF
+    self._shY = self._my + SHADOW_OFF
+
     return self
   end
 
@@ -185,7 +245,7 @@ return function(ctx)
   function Modal:render()
     if not self._open then return end
 
-    if not theme.isColor then
+    if not isColor then
       -- B&W: simple framed box
       lcd.drawFilledRectangle(self._mx, self._my, self._mw, self._mh, ERASE)
       lcd.drawRectangle(self._mx, self._my, self._mw, self._mh, SOLID)
@@ -196,66 +256,36 @@ return function(ctx)
 
     -- Overlay
     if self._overlay then
-      lcd.setColor(CUSTOM_COLOR, theme.C.overlay)
+      lcd.setColor(CUSTOM_COLOR, C_overlay)
       lcd.drawFilledRectangle(0, 0, LCD_W, LCD_H, CUSTOM_COLOR)
     end
 
-    -- Drop shadow (offset dark rect behind modal)
-    local sh = scale.s(4)
-    lcd.setColor(CUSTOM_COLOR, theme.C.overlay)
-    lcd.drawFilledRectangle(self._mx + sh, self._my + sh, self._mw, self._mh, CUSTOM_COLOR)
+    -- Drop shadow (pre-computed offset)
+    lcd.setColor(CUSTOM_COLOR, C_overlay)
+    lcd.drawFilledRectangle(self._shX, self._shY, self._mw, self._mh, CUSTOM_COLOR)
 
     -- Modal background
-    lcd.setColor(CUSTOM_COLOR, theme.C.header)
+    lcd.setColor(CUSTOM_COLOR, C_header)
     lcd.drawFilledRectangle(self._mx, self._my, self._mw, self._mh, CUSTOM_COLOR)
 
     -- 1px border
-    lcd.setColor(CUSTOM_COLOR, theme.C.panel)
+    lcd.setColor(CUSTOM_COLOR, C_panel)
     lcd.drawRectangle(self._mx, self._my, self._mw, self._mh, CUSTOM_COLOR)
 
     -- Accent bar at top
     lcd.setColor(CUSTOM_COLOR, self._sevColor)
     lcd.drawFilledRectangle(self._mx, self._my, self._mw, self._accentH, CUSTOM_COLOR)
 
-    -- Title text
-    local titleFont = (self._type == "confirm") and theme.F.body or theme.F.title
-    local titleFH   = (self._type == "confirm") and theme.FH.body or theme.FH.title
+    -- Title text (position pre-computed)
+    lcd.drawText(self._titleX, self._titleY, self._title, self._titleFontCC)
 
-    -- Vertically center text block between accent bar bottom and button/spinner top
-    local accentBot = self._my + self._accentH
-    local hasMsg = #self._lines > 0 and self._type ~= "confirm"
-    local lineGap = scale.sy(4)
-    local textBlockH = titleFH
-    if hasMsg then
-      textBlockH = textBlockH + scale.sy(10)
-                 + theme.FH.small * #self._lines
-                 + lineGap * (#self._lines - 1)
-    end
-
-    local btnTop
-    if self._type == "info" then
-      btnTop = self._my + self._mh - scale.sy(50) - scale.s(20)
-    else
-      btnTop = self._my + self._mh - scale.sy(32) - scale.sy(16)
-    end
-    local zoneH = btnTop - accentBot
-    local titleY = accentBot + math.floor((zoneH - textBlockH) / 2)
-
-    lcd.setColor(CUSTOM_COLOR, self._sevColor)
-    -- Center title horizontally
-    local tw = lcd.sizeText and lcd.sizeText(self._title, titleFont) or 0
-    local tx = self._mx + math.floor((self._mw - tw) / 2)
-    lcd.drawText(tx, titleY, self._title, titleFont + CUSTOM_COLOR)
-
-    -- Message text (for alert and info types) — each line centered
-    if hasMsg then
-      lcd.setColor(CUSTOM_COLOR, theme.C.subtext)
-      local lineY = titleY + titleFH + scale.sy(10)
-      for _, line in ipairs(self._lines) do
-        local lw = lcd.sizeText and lcd.sizeText(line, theme.F.small) or 0
-        local lx = self._mx + math.floor((self._mw - lw) / 2)
-        lcd.drawText(lx, lineY, line, theme.F.small + CUSTOM_COLOR)
-        lineY = lineY + theme.FH.small + lineGap
+    -- Message text (positions pre-computed)
+    if self._hasMsg then
+      lcd.setColor(CUSTOM_COLOR, C_subtext)
+      local lineY = self._lineY0
+      for i, line in ipairs(self._lines) do
+        lcd.drawText(self._lineXs[i], lineY, line, F_SMALL_CC)
+        lineY = lineY + FH_small + LINE_GAP
       end
     end
 

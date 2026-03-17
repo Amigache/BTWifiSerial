@@ -35,6 +35,19 @@ return function(ctx)
   local theme    = ctx.theme
   local scale    = ctx.scale
 
+  -- Cache theme values as locals (avoid 2-level hash lookups per frame)
+  local isColor  = theme.isColor
+  local C_text   = theme.C.text
+  local C_accent = theme.C.accent
+  local C_bg     = theme.C.bg
+  local C_editBg = theme.C.editBg
+  local C_panel  = theme.C.panel
+  local F_small  = theme.F.small
+
+  -- Pre-computed font + flag combos
+  local F_SMALL_CC = F_small + CUSTOM_COLOR
+  local TRI_FL     = isColor and CUSTOM_COLOR or 0
+
   local PAD      = scale.sx(17)
   local SCROLL_W = scale.sx(28)   -- right column reserved for arrows
   local ROW_GAP  = scale.sx(8)    -- gap between last row pixel and arrow area
@@ -42,22 +55,21 @@ return function(ctx)
 
   -- ── Triangle helper (mirrors reference drawTri) ────────────────
   local function drawTri(cx, cy, sz, up, color)
-    if theme.isColor then
+    if isColor then
       lcd.setColor(CUSTOM_COLOR, color)
     end
-    local fl = theme.isColor and CUSTOM_COLOR or 0
     for i = 0, sz do
       local hw = up and i or (sz - i)
-      lcd.drawLine(cx - hw, cy + i, cx + hw, cy + i, SOLID, fl)
+      lcd.drawLine(cx - hw, cy + i, cx + hw, cy + i, SOLID, TRI_FL)
     end
   end
 
   -- ── Truncate text to fit maxW pixels ───────────────────────────
+  local _ellipsisW = lcd.sizeText and lcd.sizeText("...", SMLSIZE) or 0
   local function fitText(s, font, maxW)
     if not lcd.sizeText or maxW <= 0 then return s end
     if lcd.sizeText(s, font) <= maxW then return s end
-    local ew = lcd.sizeText("...", font)
-    while #s > 0 and lcd.sizeText(s, font) + ew > maxW do
+    while #s > 0 and lcd.sizeText(s, font) + _ellipsisW > maxW do
       s = string.sub(s, 1, #s - 1)
     end
     return s .. "..."
@@ -128,37 +140,54 @@ return function(ctx)
     -- Number of columns (cached for render loop)
     self._numCols = #self.cols
 
-    return self
-  end
-
-  -- ── Column x helper (called in render for each column) ─────────
-  -- Returns colX, colMaxW for a given column index.
-  function List:_colPos(ci)
-    local col  = self.cols[ci]
-    local frac = col.xFrac or 0
-    local cx
-
-    -- Compute column start x
-    if frac > 0 then
-      cx = self.x + math.floor(self._contentW * frac)
-    else
-      cx = self.x + self.padX
-    end
-
-    -- Compute max text width: from cx to next column start (or row end)
-    local endX
-    if ci < self._numCols then
-      local nf = self.cols[ci + 1].xFrac or 0
-      if nf > 0 then
-        endX = self.x + math.floor(self._contentW * nf) - self.padX
+    -- Pre-compute column positions (avoids math.floor per col per row per frame)
+    self._colX = {}
+    self._colMaxW = {}
+    for ci = 1, self._numCols do
+      local col  = self.cols[ci]
+      local frac = col.xFrac or 0
+      local cx
+      if frac > 0 then
+        cx = self.x + math.floor(self._contentW * frac)
       else
-        endX = self.x + self.padX
+        cx = self.x + self.padX
       end
-    else
-      endX = self.x + self._rowFillW - self.padX
+      self._colX[ci] = cx
+
+      local endX
+      if ci < self._numCols then
+        local nf = self.cols[ci + 1].xFrac or 0
+        if nf > 0 then
+          endX = self.x + math.floor(self._contentW * nf) - self.padX
+        else
+          endX = self.x + self.padX
+        end
+      else
+        endX = self.x + self._rowFillW - self.padX
+      end
+      self._colMaxW[ci] = math.max(0, endX - cx)
     end
 
-    return cx, math.max(0, endX - cx)
+    -- Pre-extract column keys and alignment flags (avoid dot-chains per cell)
+    self._colKeys    = {}
+    self._colIsRight = {}
+    for ci = 1, self._numCols do
+      self._colKeys[ci]    = self.cols[ci].key
+      self._colIsRight[ci] = (self.cols[ci].align == "right")
+    end
+
+    -- Pre-compute scroll arrow positions (all immutable)
+    local arrowMargin     = math.floor((self.rowH - ARROW_SZ) / 2)
+    self._upArrowY        = self.y + arrowMargin
+    self._dnArrowY        = self.y + self.h - self.rowH + arrowMargin - scale.sy(6)
+
+    -- Pre-computed font+flag combo for render
+    self._fontCC  = self.font + CUSTOM_COLOR
+
+    -- Render cache: fitted text per cell, invalidated by setRows()
+    self._rcache  = {}
+
+    return self
   end
 
   -- ── Selection API ──────────────────────────────────────────────
@@ -232,6 +261,8 @@ return function(ctx)
     if ci > #row._options then ci = 1 end
     if ci < 1 then ci = #row._options end
     row[col.key] = row._options[ci]
+    -- Invalidate render cache for this row
+    self._rcache[self._sel] = nil
   end
 
   function List:handleEvent(event)
@@ -282,21 +313,31 @@ return function(ctx)
     local canUp  = self._offset > 0
     local canDn  = self._offset + self.maxVisible < total
 
+    local colKeys    = self._colKeys
+    local colIsRight = self._colIsRight
+    local colX       = self._colX
+    local colMaxW    = self._colMaxW
+    local numCols    = self._numCols
+    local fontCC     = self._fontCC
+    local font       = self.font
+    local rcache     = self._rcache
+    local rowBg      = self._rowBg or C_bg
+
     -- Rows
     for slot = self._offset + 1, last do
       local row   = self.rows[slot]
       local ry    = self.y + (slot - 1 - self._offset) * self.rowH
       local isSel = self.selectable and (slot == self._sel)
 
-      -- Row background: editBg when editing this row, accent when selected, bg otherwise
+      -- Row background
       local isEditingThis = self._editing and isSel
-      if theme.isColor then
+      if isColor then
         if isEditingThis then
-          lcd.setColor(CUSTOM_COLOR, theme.C.editBg)
+          lcd.setColor(CUSTOM_COLOR, C_editBg)
         elseif isSel then
-          lcd.setColor(CUSTOM_COLOR, theme.C.accent)
+          lcd.setColor(CUSTOM_COLOR, C_accent)
         else
-          lcd.setColor(CUSTOM_COLOR, self._rowBg or theme.C.bg)
+          lcd.setColor(CUSTOM_COLOR, rowBg)
         end
         lcd.drawFilledRectangle(self.x, ry, self._rowFillW, self.rowH, CUSTOM_COLOR)
       else
@@ -305,56 +346,73 @@ return function(ctx)
         end
       end
 
-      -- Columns — position computed fresh per column via _colPos
+      -- Columns — use render cache for fitted text
       local ty = ry + self._txtOff
-      for ci = 1, self._numCols do
-        local col       = self.cols[ci]
-        local cx, maxW  = self:_colPos(ci)
-        local raw       = tostring(row[col.key] or "")
-        local val       = fitText(raw, self.font, maxW)
+      if isColor then
+        lcd.setColor(CUSTOM_COLOR, C_text)  -- set once per row, not per column
+      end
+      for ci = 1, numCols do
+        local cx   = colX[ci]
+        local maxW = colMaxW[ci]
 
-        -- Determine text flags: add BLINK on the edit column while editing
+        -- Lookup cached fitted text; build on miss
+        local rowCache = rcache[slot]
+        local val
+        if rowCache then
+          val = rowCache[ci]
+        end
+        if not val then
+          local raw = tostring(row[colKeys[ci]] or "")
+          val = fitText(raw, font, maxW)
+          if not rowCache then rowCache = {}; rcache[slot] = rowCache end
+          rowCache[ci] = val
+        end
+
         local isBlinkCol = isEditingThis and (ci == self._editCol)
-        if theme.isColor then
-          lcd.setColor(CUSTOM_COLOR, theme.C.text)
-          if col.align == "right" then
-            local tw = (lcd.sizeText and lcd.sizeText(val, self.font)) or 0
+        if isColor then
+          if colIsRight[ci] then
+            local tw = (lcd.sizeText and lcd.sizeText(val, font)) or 0
             cx = cx + maxW - tw
           end
-          local fl = self.font + CUSTOM_COLOR
+          local fl = fontCC
           if isBlinkCol then fl = fl + BLINK end
           lcd.drawText(cx, ty, val, fl)
         else
           local fl = isSel and INVERS or 0
           if isBlinkCol then fl = fl + BLINK end
-          lcd.drawText(cx, ty, val, self.font + fl)
+          lcd.drawText(cx, ty, val, font + fl)
         end
       end
     end
 
-    -- Scroll arrows (only when showScroll=true).
+    -- Scroll arrows (pre-computed positions)
     if self._showScroll then
-      local sz     = ARROW_SZ
-      local margin = math.floor((self.rowH - sz) / 2)
-      local ax     = self._arrowX
-
-      local upColor = canUp and theme.C.accent or theme.C.panel
-      local dnColor = canDn and theme.C.accent or theme.C.panel
-
-      local dnY = self.y + self.h - self.rowH + margin - scale.sy(6)
-      drawTri(ax, self.y + margin, sz, true,  upColor)
-      drawTri(ax, dnY,             sz, false, dnColor)
+      local ax = self._arrowX
+      local upColor = canUp and C_accent or C_panel
+      local dnColor = canDn and C_accent or C_panel
+      drawTri(ax, self._upArrowY, ARROW_SZ, true,  upColor)
+      drawTri(ax, self._dnArrowY, ARROW_SZ, false, dnColor)
     end
   end
 
   -- Update rows at runtime
   function List:setRows(rows)
     self.rows    = rows
+    self._rcache = {}  -- invalidate render cache
     self._sel    = math.min(self._sel, math.max(1, #rows))
     self._offset = 0
     -- Adjust offset so current selection remains visible
     if self._sel > self.maxVisible then
       self._offset = self._sel - self.maxVisible
+    end
+  end
+
+  -- Invalidate render cache for a single row (or all rows if idx is nil)
+  function List:dirtyCache(idx)
+    if idx then
+      self._rcache[idx] = nil
+    else
+      self._rcache = {}
     end
   end
 

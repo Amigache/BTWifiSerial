@@ -79,6 +79,32 @@ return function(ctx)
     -- Title label
     self._label:render()
 
+    -- Pending-restart badge (top-right)
+    local rp = ctx.store and ctx.store.status and ctx.store.status.restartPending
+    if rp then
+      local badgeTxt = "RESTART PENDING"
+      local f = theme.F.small
+      local th = theme.FH.small
+      local tw = (lcd.sizeText and lcd.sizeText(badgeTxt, f)) or (#badgeTxt * 7)
+      local px = scale.sx(10)
+      local py = scale.sy(4)
+      local bw = tw + px * 2
+      local bh = th + py * 2
+      local bx = self.x + self.w - bw - scale.sx(12)
+      local by = self.y + math.floor((self.h - bh) / 2)
+      if theme.isColor then
+        lcd.setColor(CUSTOM_COLOR, theme.C.modalWarning)
+        lcd.drawFilledRectangle(bx, by, bw, bh, CUSTOM_COLOR)
+        lcd.setColor(CUSTOM_COLOR, theme.C.panel)
+        lcd.drawRectangle(bx, by, bw, bh, CUSTOM_COLOR)
+        lcd.setColor(CUSTOM_COLOR, theme.C.header)
+        lcd.drawText(bx + px, by + py, badgeTxt, f + CUSTOM_COLOR)
+      else
+        lcd.drawRectangle(bx, by, bw, bh, SOLID)
+        lcd.drawText(bx + px, by + py, badgeTxt, f)
+      end
+    end
+
     -- Accent line at the bottom of the bar
     local lineY = self.y + self.h
     if theme.isColor then

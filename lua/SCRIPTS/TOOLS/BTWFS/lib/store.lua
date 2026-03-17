@@ -26,6 +26,7 @@ M.status = {
   bleConnected  = false,
   wifiClients   = false,
   bleConnecting = false,
+  restartPending = false,
 }
 
 -- ── Channel data ──────────────────────────────────────────────────
@@ -71,6 +72,7 @@ end
 function M.reset()
   M.prefs = {}; M.prefsOrder = {}; M.prefsReady = false
   M.info  = {}; M.infoOrder  = {}; M.infoReady  = false
+  M.status.restartPending = false
 end
 
 -- PREF channel ─────────────────────────────────────────────────────
@@ -141,6 +143,7 @@ function M.updateStatus(byte)
   M.status.bleConnected  = bit32.band(byte, 0x01) ~= 0
   M.status.wifiClients   = bit32.band(byte, 0x02) ~= 0
   M.status.bleConnecting = bit32.band(byte, 0x04) ~= 0
+  M.status.restartPending = bit32.band(byte, 0x08) ~= 0
   emit("status", M.status)
 end
 

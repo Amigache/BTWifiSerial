@@ -16,8 +16,16 @@ return function(ctx)
   local theme = ctx.theme
   local scale = ctx.scale
 
+  local isColor = theme.isColor
+
   local Button = {}
   Button.__index = Button
+
+  local function computeBtnPos(self)
+    local tw = (lcd.sizeText and lcd.sizeText(self.label, self.font)) or 0
+    self._tx = self.x + math.floor((self.w - tw) / 2)
+    self._ty = self.y + math.floor((self.h - self.fontH) / 2) - scale.sy(3)
+  end
 
   function Button.new(props)
     local self       = setmetatable({}, Button)
@@ -32,14 +40,16 @@ return function(ctx)
     self.fontH       = props.fontH      or theme.FH.small
     self.focused     = props.focused    or false
     self.focusColor  = props.focusColor or theme.C.accent
+    self._fontCC     = self.font + CUSTOM_COLOR
+    computeBtnPos(self)
     return self
   end
 
   function Button:setFocused(f) self.focused = f end
-  function Button:setLabel(l)   self.label = l end
+  function Button:setLabel(l)   self.label = l; computeBtnPos(self) end
 
   function Button:render()
-    if not theme.isColor then
+    if not isColor then
       local fl = self.focused and INVERS or 0
       lcd.drawText(self.x + 2, self.y + 2, self.label, self.font + fl)
       return
@@ -53,12 +63,8 @@ return function(ctx)
     end
     lcd.drawFilledRectangle(self.x, self.y, self.w, self.h, CUSTOM_COLOR)
 
-    -- Centered label
-    local tw = lcd.sizeText and lcd.sizeText(self.label, self.font) or 0
-    local tx = self.x + math.floor((self.w - tw) / 2)
-    local ty = self.y + math.floor((self.h - self.fontH) / 2) - scale.sy(3)
     lcd.setColor(CUSTOM_COLOR, self.textColor)
-    lcd.drawText(tx, ty, self.label, self.font + CUSTOM_COLOR)
+    lcd.drawText(self._tx, self._ty, self.label, self._fontCC)
   end
 
   return Button

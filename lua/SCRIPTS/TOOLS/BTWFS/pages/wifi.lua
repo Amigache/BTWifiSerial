@@ -71,10 +71,11 @@ return function(ctx)
   end
 
   -- ── IP row (mutated in place) ──────────────────────────────────────
-  local ROW_IP = { label = "IP Address", value = "192.168.4.1" }
+  local ROW_IP = { label = "IP Address", value = "--" }
 
   local function updateIpRow()
-    ROW_IP.value = (getWifiModeIdx() == 2) and "(DHCP)" or "192.168.4.1"
+    local inf = store.info and store.info[proto.INFO_WIFI_IP]
+    ROW_IP.value = (inf and inf.value and inf.value ~= "") and inf.value or "(none)"
   end
 
   -- ── Build row list ─────────────────────────────────────────────────
@@ -159,6 +160,16 @@ return function(ctx)
     store.on("status", function(s)
       _wifiActive = s.wifiClients
       updateStatus()
+    end)
+
+    store.on("info_ready", function()
+      updateIpRow()
+    end)
+
+    store.on("info_changed", function(inf)
+      if inf.id == proto.INFO_WIFI_IP then
+        updateIpRow()
+      end
     end)
 
     return self

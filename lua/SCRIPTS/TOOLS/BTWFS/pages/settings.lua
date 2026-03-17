@@ -16,16 +16,65 @@ return function(ctx)
   local input     = ctx.input
   local sendFrame = ctx.sendFrame
 
+  -- Cache theme values
+  local isColor    = theme.isColor
+  local C_text     = theme.C.text
+  local F_small    = theme.F.small
+  local F_SMALL_CC = F_small + CUSTOM_COLOR
+
+  -- Pre-compute layout constants
+  local WAITING_X = scale.sx(17)
+  local WAITING_Y_OFF = scale.sy(8)
+
   -- ── Charsets for text editing ─────────────────────────────────────
-  -- Full printable ASCII (0x20-0x7E, 95 chars) so any WPA2 password can be entered.
-  local CHARSET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 !\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
-  local NUMSET  = "0123456789"
+  local CHARSET_NUM    = "0123456789"
+  local CHARSET_ALNUM  = "abcdefghijklmnopqrstuvwxyz0123456789"
+  local CHARSET_COMMON = "abcdefghijklmnopqrstuvwxyz0123456789 _-./@:+,!?()#%&*="
+  local COMMON_CHAR_PREF = {
+    [0x06] = true, -- BT Name
+    [0x07] = true, -- AP SSID
+    [0x09] = true, -- AP Password
+    [0x0A] = true, -- STA SSID
+    [0x0B] = true, -- STA Password
+  }
 
   -- ── Event helpers ─────────────────────────────────────────────────
   local evEnter = input.evEnter
+  local evEnterLong = input.evEnterLong or function() return false end
   local evExit  = input.evExit
   local evNext  = input.evNext
   local evPrev  = input.evPrev
+
+  local function isAsciiAlpha(ch)
+    return ch and #ch == 1 and ((ch >= "a" and ch <= "z") or (ch >= "A" and ch <= "Z"))
+  end
+
+  local function findCharIndex(cs, ch)
+    for j = 1, #cs do
+      if string.sub(cs, j, j) == ch then return j end
+    end
+    return nil
+  end
+
+  local function resolveChar(te, idx)
+    local ci = te.chars[idx]
+    if not ci or ci < 1 or ci > te.csLen then return nil end
+    local ch = string.sub(te.charset, ci, ci)
+    if te.upper[idx] and ch >= "a" and ch <= "z" then
+      ch = string.upper(ch)
+    end
+    return ch
+  end
+
+  local function pickCharset(pref)
+    if bit32.band(pref.flags, proto.PF_NUMERIC) ~= 0 then
+      return CHARSET_NUM
+    end
+    if COMMON_CHAR_PREF[pref.id] then
+      return CHARSET_COMMON
+    end
+    return CHARSET_ALNUM
+  end
 
   local Settings = {}
   Settings.__index = Settings
@@ -67,7 +116,7 @@ return function(ctx)
 
   -- Update a single row whose value changed.
   local function refreshRow(self, pref)
-    for _, row in ipairs(self._list.rows) do
+    for i, row in ipairs(self._list.rows) do
       if row._prefId == pref.id then
         if pref.type == proto.FT_ENUM then
           row.value = pref.options and pref.options[pref.curIdx + 1] or "?"
@@ -79,6 +128,7 @@ return function(ctx)
         elseif pref.type == proto.FT_BOOL then
           row.value = pref.value and "On" or "Off"
         end
+        self._list:dirtyCache(i)
         return
       end
     end
@@ -111,6 +161,7 @@ return function(ctx)
     self._pendingPassEdit = false  -- auto-open password editor after SSID save
     self._wifiConnCheck  = false  -- show result modal after STA reconnect
     self._wifiConnCheckT = nil    -- deferred timer for wifi check
+    self._pendingRestartWifiCheck = false  -- set when restart-required STA_PASS is accepted
     self._lastCommittedId    = nil  -- track committed text-edit value for row refresh
     self._lastCommittedValue = nil
 
@@ -175,6 +226,11 @@ return function(ctx)
         self._wifiConnCheck  = false
         self._wifiConnCheckT = getTime()  -- deferred: status frame not yet processed
       end
+      if self._pendingRestartWifiCheck then
+        self._pendingRestartWifiCheck = false
+        self._wifiConnCheck  = false
+        self._wifiConnCheckT = getTime()
+      end
     end)
 
     store.on("pref_changed", function(pref)
@@ -202,14 +258,42 @@ return function(ctx)
           self._lastCommittedValue = nil
         end
         if needsRestart then
-          -- Device is about to restart; close spinner silently.
-          -- main.lua will show "Reconnecting..." once the device goes offline.
-          self._modal = nil
+          local shouldCheckWifiAfterRestart = false
+          if ev.id == 0x0B then
+            local wmp = store.prefs[0x01]
+            local ssid = store.prefs[0x0A]
+            if wmp and wmp.curIdx == 2 and ssid and (ssid.value or "") ~= "" then
+              shouldCheckWifiAfterRestart = true
+            end
+          end
+          self._modal = Modal.new({
+            type     = "confirm",
+            severity = "warning",
+            title    = "Restart Required",
+            message  = "Apply now or later?",
+            onResult = function(accepted)
+              if accepted then
+                self._pendingRestartWifiCheck = shouldCheckWifiAfterRestart
+                sendFrame(proto.buildInfoRestart())
+                self._modal = Modal.new({
+                  type     = "info",
+                  severity = "info",
+                  title    = "Restarting...",
+                  message  = "Applying changes...",
+                })
+                self._modal:show()
+              else
+                self._pendingRestartWifiCheck = false
+              end
+            end,
+          })
+          self._modal:show()
+          return
         end
         -- Auto-open password editor after SSID save from WiFi picker
         if self._pendingPassEdit and ev.id == 0x0A then
           self._pendingPassEdit = false
-          self._wifiConnCheck   = true  -- check wifi after password save + restart
+          self._wifiConnCheckT  = nil
           -- Navigate list to STA Password row and open text editor
           for i, row in ipairs(self._list.rows) do
             if row._prefId == 0x0B then
@@ -258,38 +342,47 @@ return function(ctx)
   function Settings:_startTextEdit(id)
     local p = store.prefs[id]
     if not p or p.type ~= proto.FT_STRING then return end
-    local isNumeric = bit32.band(p.flags, proto.PF_NUMERIC) ~= 0
-    local cs  = isNumeric and NUMSET or CHARSET
+    local cs  = pickCharset(p)
     local val = p.value or ""
     local maxLen = p.maxLen or 15
     -- Populate chars from current value
     local chars = {}
+    local upper = {}
     for i = 1, math.min(#val, maxLen) do
       local ch = string.sub(val, i, i)
-      local ci = 1
-      for j = 1, #cs do
-        if string.sub(cs, j, j) == ch then ci = j; break end
+      local base = string.lower(ch)
+      local ci = findCharIndex(cs, base)
+      if ci then
+        chars[i] = ci
+        upper[i] = (ch ~= base) and isAsciiAlpha(ch)
       end
-      chars[i] = ci
     end
     -- Add end-of-input marker after current content
     if #chars < maxLen then
       chars[#chars + 1] = #cs + 1
     end
     self._textEdit = {
-      prefId  = id,
-      maxLen  = maxLen,
-      charset = cs,
-      chars   = chars,
-      cursor  = 1,
+      prefId         = id,
+      title          = p.label or "Edit",
+      maxLen         = maxLen,
+      charset        = cs,
+      csLen          = #cs,
+      chars          = chars,
+      upper          = upper,
+      cursor         = 1,
+      _teRenderCache = nil,   -- cached render strings; nil = dirty
     }
   end
 
   -- Commit the edited string: close editor, send PREF_SET, show spinner.
   function Settings:_commitTextEdit(id, value)
-    self._textEdit = nil
     local p = store.prefs[id]
     if not p then return end
+    self._textEdit = nil
+    value = string.match(value or "", "^%s*(.-)%s*$") or ""   -- trim
+    if value == (p.value or "") then
+      return
+    end
     self._savingId           = id
     self._lastCommittedId    = id
     self._lastCommittedValue = value
@@ -307,46 +400,61 @@ return function(ctx)
   -- Handle events while text editor is active.
   function Settings:_handleTextEdit(event)
     local te = self._textEdit
+    te._teRenderCache = nil   -- any event may change visible state; rebuild on next render
     local cs    = te.charset
-    local csLen = #cs
-    if evEnter(event) then
+    local csLen = te.csLen
+    if evEnterLong(event) then
+      local ci = te.chars[te.cursor]
+      if ci and ci >= 1 and ci <= csLen then
+        local ch = string.sub(cs, ci, ci)
+        if ch >= "a" and ch <= "z" then
+          te.upper[te.cursor] = not te.upper[te.cursor]
+        end
+      end
+      return true
+    elseif evEnter(event) then
       local ci = te.chars[te.cursor]
       if ci == nil or ci > csLen then
         -- End-of-input marker selected: commit everything up to cursor-1
         local result = ""
         for i = 1, te.cursor - 1 do
-          local c = te.chars[i]
-          if c and c >= 1 and c <= csLen then
-            result = result .. string.sub(cs, c, c)
-          end
+          local ch = resolveChar(te, i)
+          if ch then result = result .. ch end
         end
         self:_commitTextEdit(te.prefId, result)
       else
         -- Advance cursor
         te.cursor = te.cursor + 1
         if te.cursor > te.maxLen then
-          -- Reached max length: commit entire buffer
+          -- Reached max length: commit entire buffer (trim handled in _commitTextEdit)
           local result = ""
           for i = 1, te.maxLen do
-            local c = te.chars[i]
-            if c and c >= 1 and c <= csLen then
-              result = result .. string.sub(cs, c, c)
-            end
+            local ch = resolveChar(te, i)
+            if ch then result = result .. ch end
           end
           self:_commitTextEdit(te.prefId, result)
         elseif te.cursor > #te.chars then
           -- Past end of pre-loaded text: place end marker
           te.chars[te.cursor] = csLen + 1
+          te.upper[te.cursor] = nil
         end
       end
       return true
     elseif evExit(event) then
-      self._textEdit = nil
-      -- Restore the row's visible value (it was cleared for inline rendering)
-      local p = store.prefs[te.prefId]
-      if p then
-        for _, row in ipairs(self._list.rows) do
-          if row._prefId == te.prefId then row.value = p.value or ""; break end
+      if te.cursor > 1 then
+        te.cursor = te.cursor - 1
+      else
+        self._textEdit = nil
+        -- Restore the row's visible value (it was cleared for inline rendering)
+        local p = store.prefs[te.prefId]
+        if p then
+          for i, row in ipairs(self._list.rows) do
+            if row._prefId == te.prefId then
+              row.value = p.value or ""
+              self._list:dirtyCache(i)
+              break
+            end
+          end
         end
       end
       return true
@@ -355,15 +463,97 @@ return function(ctx)
       ci = ci + 1
       if ci > csLen + 1 then ci = 1 end
       te.chars[te.cursor] = ci
+      if ci > csLen then te.upper[te.cursor] = nil end
       return true
     elseif evPrev(event) then
       local ci = te.chars[te.cursor] or 1
       ci = ci - 1
       if ci < 1 then ci = csLen + 1 end
       te.chars[te.cursor] = ci
+      if ci > csLen then te.upper[te.cursor] = nil end
       return true
     end
     return false
+  end
+
+  function Settings:_renderTextEditModal()
+    local te = self._textEdit
+    if not te then return end
+
+    local mw = scale.sx(320)
+    local mh = scale.sy(140)
+    local mx = math.floor((scale.W - mw) / 2)
+    local my = math.floor((scale.H - mh) / 2)
+    local th = scale.sy(34)
+    local title = te.title or "Edit"
+    local titleW = (lcd.sizeText and lcd.sizeText(title, F_small)) or (#title * 7)
+    local titleX = mx + math.floor((mw - titleW) / 2)
+
+    if isColor then
+      lcd.setColor(CUSTOM_COLOR, theme.C.overlay)
+      lcd.drawFilledRectangle(0, 0, scale.W, scale.H, CUSTOM_COLOR)
+      lcd.setColor(CUSTOM_COLOR, theme.C.header)
+      lcd.drawFilledRectangle(mx, my, mw, mh, CUSTOM_COLOR)
+      lcd.setColor(CUSTOM_COLOR, theme.C.panel)
+      lcd.drawRectangle(mx, my, mw, mh, CUSTOM_COLOR)
+      lcd.setColor(CUSTOM_COLOR, theme.C.accent)
+      lcd.drawFilledRectangle(mx, my, mw, th, CUSTOM_COLOR)
+      lcd.setColor(CUSTOM_COLOR, C_text)
+      lcd.drawText(titleX, my + scale.sy(6), title, F_SMALL_CC)
+    else
+      lcd.drawFilledRectangle(mx, my, mw, mh, ERASE)
+      lcd.drawRectangle(mx, my, mw, mh, SOLID)
+      lcd.drawText(titleX, my + scale.sy(4), title, SMLSIZE + BOLD)
+    end
+
+    local rowY = my + th + scale.sy(40)
+    local font = F_small
+
+    -- Rebuild render cache only when dirty (invalidated by _handleTextEdit on any event).
+    -- This avoids 3 lcd.sizeText() calls + string building on no-input frames.
+    if not te._teRenderCache then
+      local pre = ""
+      for i = 1, te.cursor - 1 do
+        local ch = resolveChar(te, i)
+        if ch then pre = pre .. ch end
+      end
+      local ci = te.chars[te.cursor]
+      local isEnd = (ci == nil or ci > te.csLen)
+      local curCh = isEnd and " " or (resolveChar(te, te.cursor) or " ")
+      local post = ""
+      for i = te.cursor + 1, #te.chars do
+        local ch = resolveChar(te, i)
+        if ch then post = post .. ch end
+      end
+      local allTxt = pre .. curCh .. post
+      local allW = (lcd.sizeText and lcd.sizeText(allTxt, font)) or (#allTxt * 8)
+      local preW
+      if pre ~= "" then
+        preW = (lcd.sizeText and lcd.sizeText(pre, font)) or (#pre * 8)
+      else
+        preW = 0
+      end
+      local curW = (lcd.sizeText and lcd.sizeText(curCh, font)) or 8
+      te._teRenderCache = {
+        pre = pre, curCh = curCh, post = post,
+        isEnd = isEnd, allW = allW, preW = preW, curW = curW,
+      }
+    end
+    local c = te._teRenderCache
+    local sx = mx + math.floor((mw - c.allW) / 2)
+
+    if isColor then lcd.setColor(CUSTOM_COLOR, C_text) end
+    local colFlag = isColor and CUSTOM_COLOR or 0
+    if c.pre ~= "" then
+      lcd.drawText(sx, rowY, c.pre, font + colFlag)
+    end
+    lcd.drawText(sx + c.preW, rowY, c.curCh, font + colFlag)
+    if c.post ~= "" then
+      lcd.drawText(sx + c.preW + c.curW, rowY, c.post, font + colFlag)
+    end
+
+    local caretY = rowY + theme.FH.small + scale.sy(2)
+    lcd.drawText(sx + c.preW, caretY, "_", font + BLINK + colFlag)
   end
 
 
@@ -415,6 +605,8 @@ return function(ctx)
     -- Bump generation so stale callbacks from a previous scan are ignored
     self._wifiScanGen = self._wifiScanGen + 1
     self._activeWifiScanGen = self._wifiScanGen
+    self._wifiConnCheck = false
+    self._wifiConnCheckT = nil
 
     self._pickModal = PickModal.new({
       title    = "Select WiFi Network",
@@ -426,6 +618,8 @@ return function(ctx)
             -- Save SSID (firmware won't restart); then auto-open password editor
             self._savingId = 0x0A
             self._pendingPassEdit = true
+            self._lastCommittedId = 0x0A
+            self._lastCommittedValue = item.value
             sendFrame(proto.buildPrefSet(0x0A, proto.FT_STRING, item.value))
             store.pendingPrefId = 0x0A
             self._modal = Modal.new({
@@ -450,7 +644,11 @@ return function(ctx)
       if getTime() - self._wifiConnCheckT > 200 then
         self._wifiConnCheckT = nil
         local wmp = store.prefs[0x01]
-        if (wmp and wmp.curIdx == 2) and not store.status.wifiClients then
+        if self._pendingRestartWifiCheck then
+          -- Device just restarted; give it another 2 s before checking STA status.
+          self._pendingRestartWifiCheck = false
+          self._wifiConnCheckT = getTime()
+        elseif (wmp and wmp.curIdx == 2) and not store.status.wifiClients then
           self._modal = Modal.new({
             type = "alert", severity = "warning",
             title = "Connection Failed",
@@ -508,65 +706,8 @@ return function(ctx)
   end
 
   function Settings:render()
-    -- While text-editing: clear the row's value so the list draws nothing in
-    -- the value column; we render pre/cursor/post ourselves right after.
-    if self._textEdit then
-      for _, row in ipairs(self._list.rows) do
-        if row._prefId == self._textEdit.prefId then
-          row.value = ""
-          break
-        end
-      end
-    end
-
     self._page:render()
-
-    -- Inline character-by-character text editor drawn on top of the row
-    if self._textEdit then
-      local te   = self._textEdit
-      local list = self._list
-      local slot = list._sel - list._offset
-      if slot >= 1 and slot <= list.maxVisible then
-        local ty    = list.y + (slot - 1) * list.rowH + list._txtOff
-        local valX  = list.x + math.floor(list._contentW * 0.54)
-        local cs    = te.charset
-        local csLen = #cs
-        -- Pre-cursor: confirmed characters
-        local pre = ""
-        for i = 1, te.cursor - 1 do
-          local c = te.chars[i]
-          if c and c >= 1 and c <= csLen then
-            pre = pre .. string.sub(cs, c, c)
-          end
-        end
-        -- Cursor character (will blink)
-        local ci    = te.chars[te.cursor]
-        local isEnd = (ci == nil or ci > csLen)
-        local curCh = isEnd and "_" or string.sub(cs, ci, ci)
-        -- Post-cursor: pre-loaded characters after cursor
-        local post = ""
-        for i = te.cursor + 1, #te.chars do
-          local c = te.chars[i]
-          if c and c >= 1 and c <= csLen then
-            post = post .. string.sub(cs, c, c)
-          end
-        end
-        -- Draw pre (solid) + cursor (BLINK) + post (solid)
-        local font    = list.font
-        local colFlag = theme.isColor and CUSTOM_COLOR or 0
-        if theme.isColor then lcd.setColor(CUSTOM_COLOR, theme.C.text) end
-        local preW = 0
-        if pre ~= "" then
-          lcd.drawText(valX, ty, pre, font + colFlag)
-          preW = (lcd.sizeText and lcd.sizeText(pre, font)) or (#pre * 8)
-        end
-        lcd.drawText(valX + preW, ty, curCh, font + BLINK + colFlag)
-        if post ~= "" then
-          local curW = (lcd.sizeText and lcd.sizeText(curCh, font)) or 8
-          lcd.drawText(valX + preW + curW, ty, post, font + colFlag)
-        end
-      end
-    end
+    if self._textEdit then self:_renderTextEditModal() end
 
     if self._modal then
       self._modal:render()
@@ -579,10 +720,9 @@ return function(ctx)
     end
 
     if not store.prefsReady then
-      local lx = scale.sx(17)
-      local ly = self._page.contentY + scale.sy(8)
-      lcd.drawText(lx, ly, "Waiting for device…",
-                   (theme.isColor and CUSTOM_COLOR or 0))
+      local ly = self._page.contentY + WAITING_Y_OFF
+      lcd.drawText(WAITING_X, ly, "Waiting for device…",
+                   (isColor and CUSTOM_COLOR or 0))
     end
   end
 

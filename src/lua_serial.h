@@ -28,6 +28,7 @@
  * CH_INFO types (ESP32 → Lua):
  *   0x01  PT_INFO_CHANNELS    payload: 8×int16 BE = 16 bytes
  *   0x02  PT_INFO_STATUS      payload: status(1)  bit0=BLE bit1=WiFiClients bit2=Connecting
+ *                                              bit3=restartPending
  *   0x03  PT_INFO_BEGIN       payload: count(1)
  *   0x04  PT_INFO_ITEM        payload: id(1) type(1) llen(1) label(N) value(var)
  *   0x05  PT_INFO_END         no payload
@@ -77,6 +78,7 @@
  *   0x01  FIRMWARE  STRING  build timestamp "DDMMYYYY HHMM"
  *   0x02  BT_ADDR   STRING  local BT MAC "XX:XX:XX:XX:XX:XX"
  *   0x03  REM_ADDR  STRING  saved remote MAC or "(none)"
+ *   0x04  WIFI_IP   STRING  AP IP / STA DHCP IP / "(none)" when WiFi is off
  */
 
 #pragma once
@@ -127,6 +129,7 @@ static constexpr uint8_t LUA_PT_INFO_BLE_RECONNECT  = 0x16;
 static constexpr uint8_t LUA_PT_INFO_WIFI_SCAN_STATUS = 0x09;  ///< ESP32→Lua: state(1) count(1); state: 0=fail 1=scanning 2=done
 static constexpr uint8_t LUA_PT_INFO_WIFI_SCAN_ITEM   = 0x0A;  ///< ESP32→Lua: idx(1) rssi_s8(1) ssid_len(1) ssid(N)
 static constexpr uint8_t LUA_PT_INFO_WIFI_SCAN        = 0x17;  ///< Lua→ESP32: start WiFi scan; no payload
+static constexpr uint8_t LUA_PT_INFO_RESTART          = 0x18;  ///< Lua→ESP32: apply pending config and restart
 
 // ── CH_TRANS types ───────────────────────────────────────────────────
 static constexpr uint8_t LUA_PT_TRANS_SBUS  = 0x01;
@@ -163,7 +166,8 @@ static constexpr uint8_t LUA_PREF_COUNT       = 11;
 static constexpr uint8_t LUA_INFO_FIRMWARE = 0x01;
 static constexpr uint8_t LUA_INFO_BT_ADDR  = 0x02;
 static constexpr uint8_t LUA_INFO_REM_ADDR = 0x03;
-static constexpr uint8_t LUA_INFO_COUNT    = 3;
+static constexpr uint8_t LUA_INFO_WIFI_IP  = 0x04;
+static constexpr uint8_t LUA_INFO_COUNT    = 4;
 
 // ── Timing ───────────────────────────────────────────────────────────
 static constexpr uint32_t LUA_CH_FRAME_INTERVAL  = 10;     // ms — ~100 Hz channel TX

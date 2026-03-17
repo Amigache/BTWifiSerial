@@ -33,6 +33,7 @@ M.PT_INFO_STATUS      = 0x02  -- Status bits;   payload: status(1)
                                --   bit0: BLE connected
                                --   bit1: WiFi AP has clients
                                --   bit2: BLE connecting
+                               --   bit3: config changes pending restart
 M.PT_INFO_BEGIN       = 0x03  -- Info list start;  payload: count(1)
 M.PT_INFO_ITEM        = 0x04  -- One info descriptor;   payload: variable
 M.PT_INFO_END         = 0x05  -- Info list end;   no payload
@@ -54,6 +55,7 @@ M.PT_INFO_BLE_DISCONNECT = 0x14  -- Disconnect;                 no payload
 M.PT_INFO_BLE_FORGET     = 0x15  -- Forget saved device;        no payload
 M.PT_INFO_BLE_RECONNECT  = 0x16  -- Reconnect to saved device;  no payload
 M.PT_INFO_WIFI_SCAN      = 0x17  -- Start WiFi scan;             no payload
+M.PT_INFO_RESTART        = 0x18  -- Request immediate device restart; no payload
 
 -- ── CH_TRANS frame types (bidirectional) ─────────────────────────
 M.PT_TRANS_SBUS  = 0x01
@@ -76,6 +78,7 @@ M.PF_NUMERIC   = 0x08  -- FT_STRING: only numeric digit input (0-9)
 M.INFO_FIRMWARE = 0x01  -- Build timestamp string
 M.INFO_BT_ADDR  = 0x02  -- Local BT MAC address
 M.INFO_REM_ADDR = 0x03  -- Saved remote BT MAC address ("(none)" when empty)
+M.INFO_WIFI_IP  = 0x04  -- Active WiFi IP (AP/STA) or "(none)"
 
 -- ── PREF_ACK result codes ─────────────────────────────────────────
 M.ACK_OK  = 0x00
@@ -154,6 +157,10 @@ end
 
 function M.buildInfoWifiScan()
   return buildFrame(M.CH_INFO, M.PT_INFO_WIFI_SCAN, {})
+end
+
+function M.buildInfoRestart()
+  return buildFrame(M.CH_INFO, M.PT_INFO_RESTART, {})
 end
 
 -- Build a transparent passthrough frame.
@@ -393,7 +400,11 @@ function M.newParser(onFrame)
   -- States: 0=wait-sync  1=ch  2=type  3=len  4=accumulate  5=crc
   local st     = 0
   local ch, typ, needed
+  -- Reuse a single buffer table across frames to avoid per-frame GC pressure.
+  -- Entries beyond the new frame length are nilled before accumulation so that
+  -- #buf always equals the actual payload length delivered to onFrame.
   local buf    = {}
+  local bufLen = 0
   local crcAcc = 0
 
   return function(b)
@@ -407,12 +418,17 @@ function M.newParser(onFrame)
       typ = b; crcAcc = bit32.bxor(crcAcc, b); st = 3
 
     elseif st == 3 then
-      needed = b; crcAcc = bit32.bxor(crcAcc, b)
-      buf = {}
+      local newLen = b
+      crcAcc = bit32.bxor(crcAcc, newLen)
+      -- Trim leftover entries from a longer previous frame so #buf == newLen.
+      for i = newLen + 1, bufLen do buf[i] = nil end
+      bufLen = 0
+      needed = newLen
       st = (needed == 0) and 5 or 4
 
     elseif st == 4 then
-      buf[#buf + 1] = b
+      bufLen = bufLen + 1
+      buf[bufLen] = b
       crcAcc = bit32.bxor(crcAcc, b)
       needed = needed - 1
       if needed == 0 then st = 5 end

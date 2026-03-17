@@ -89,6 +89,7 @@ void mainSetTelemOutput(uint8_t output);   // save config + restart into telemet
 void mainSetDeviceMode(uint8_t mode);      // save device mode + restart
 void mainSetMirrorBaud(uint32_t baud);     // save mirror baud + restart
 void mainSetWifiMode(uint8_t mode);        // save wifi mode + restart
+void mainRequestConfigRestart();           // apply current config and restart
 
 // ═════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════
 // SETUP
@@ -429,6 +430,26 @@ void mainSetWifiMode(uint8_t mode) {
     uint8_t bootMode = BOOT_NORMAL;
     if      (mode == 1) bootMode = BOOT_AP_MODE;
     else if (mode == 2) bootMode = BOOT_STA_MODE;
+    writeBootMode(bootMode);
+    blinkLed(3, 80, 80);
+    delay(100);
+    ESP.restart();
+}
+
+void mainRequestConfigRestart() {
+    uint8_t bootMode = BOOT_NORMAL;
+
+    // Explicit WiFi mode has priority over telemetry AP mapping.
+    if (g_config.wifiMode == WifiMode::AP) {
+        bootMode = BOOT_AP_MODE;
+    } else if (g_config.wifiMode == WifiMode::STA) {
+        bootMode = BOOT_STA_MODE;
+    } else if (g_config.deviceMode == DeviceMode::TELEMETRY &&
+               g_config.telemetryOutput == TelemetryOutput::WIFI_UDP) {
+        bootMode = BOOT_TELEM_AP;
+    }
+
+    LOG_I("MAIN", "Config restart requested (bootMode=%u)", bootMode);
     writeBootMode(bootMode);
     blinkLed(3, 80, 80);
     delay(100);

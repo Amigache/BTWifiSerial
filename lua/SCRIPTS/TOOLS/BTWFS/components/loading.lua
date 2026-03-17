@@ -15,6 +15,10 @@ return function(ctx)
   local theme = ctx.theme
   local scale = ctx.scale
 
+  -- Cache theme values
+  local isColor = theme.isColor
+  local C_panel = theme.C.panel
+
   local Loading = {}
   Loading.__index = Loading
 
@@ -30,6 +34,34 @@ return function(ctx)
     self._frame    = 0
     self._speed    = 3   -- advance every N render calls
     self._tick     = 0
+
+    -- Pre-compute segment endpoints (avoids cos/sin/floor every frame)
+    local seg  = self.segments
+    local step = 2 * math.pi / seg
+    local rIn  = math.floor(self.r * 0.4)
+    local rOut = self.r
+    local geo  = {}
+    for i = 0, seg - 1 do
+      local angle = i * step - math.pi / 2
+      geo[i] = {
+        math.floor(self.cx + math.cos(angle) * rIn),
+        math.floor(self.cy + math.sin(angle) * rIn),
+        math.floor(self.cx + math.cos(angle) * rOut),
+        math.floor(self.cy + math.sin(angle) * rOut),
+      }
+    end
+    self._geo = geo
+
+    -- Pre-compute tail alpha colors
+    if theme.isColor then
+      local tailColors = {}
+      for d = 0, self.tailLen - 1 do
+        local alpha = math.floor(255 * (self.tailLen - d) / self.tailLen)
+        tailColors[d] = lcd.RGB(alpha, alpha, alpha)
+      end
+      self._tailColors = tailColors
+    end
+
     return self
   end
 
@@ -41,34 +73,25 @@ return function(ctx)
       self._frame = (self._frame + 1) % self.segments
     end
 
-    local seg  = self.segments
-    local step = 2 * math.pi / seg
-    local rIn  = math.floor(self.r * 0.4)
-    local rOut = self.r
+    local seg   = self.segments
+    local geo   = self._geo
+    local frame = self._frame
+    local tLen  = self.tailLen
 
     for i = 0, seg - 1 do
-      local angle = i * step - math.pi / 2   -- start from top
-      local x1 = self.cx + math.floor(math.cos(angle) * rIn)
-      local y1 = self.cy + math.floor(math.sin(angle) * rIn)
-      local x2 = self.cx + math.floor(math.cos(angle) * rOut)
-      local y2 = self.cy + math.floor(math.sin(angle) * rOut)
+      local g = geo[i]
+      local dist = (frame - i) % seg
+      local lit  = dist < tLen
 
-      -- Determine brightness: segments in the tail are lit
-      local dist = (self._frame - i) % seg
-      local lit  = dist < self.tailLen
-
-      if theme.isColor then
+      if isColor then
         if lit then
-          -- Fade: closer to head = brighter
-          local alpha = math.floor(255 * (self.tailLen - dist) / self.tailLen)
-          lcd.setColor(CUSTOM_COLOR, lcd.RGB(alpha, alpha, alpha))
+          lcd.setColor(CUSTOM_COLOR, self._tailColors[dist])
         else
-          lcd.setColor(CUSTOM_COLOR, theme.C.panel)
+          lcd.setColor(CUSTOM_COLOR, C_panel)
         end
-        lcd.drawLine(x1, y1, x2, y2, SOLID, CUSTOM_COLOR)
+        lcd.drawLine(g[1], g[2], g[3], g[4], SOLID, CUSTOM_COLOR)
       else
-        local fl = lit and FORCE or 0
-        lcd.drawLine(x1, y1, x2, y2, SOLID, fl)
+        lcd.drawLine(g[1], g[2], g[3], g[4], SOLID, lit and FORCE or 0)
       end
     end
   end

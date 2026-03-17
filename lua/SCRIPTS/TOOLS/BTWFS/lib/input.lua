@@ -8,6 +8,11 @@ function M.evEnter(e)
       or (EVT_ENTER_BREAK   ~= nil and e == EVT_ENTER_BREAK)
 end
 
+function M.evEnterLong(e)
+  return (EVT_VIRTUAL_ENTER_LONG ~= nil and e == EVT_VIRTUAL_ENTER_LONG)
+      or (EVT_ENTER_LONG         ~= nil and e == EVT_ENTER_LONG)
+end
+
 function M.evExit(e)
   return (EVT_VIRTUAL_EXIT ~= nil and e == EVT_VIRTUAL_EXIT)
       or (EVT_EXIT_BREAK   ~= nil and e == EVT_EXIT_BREAK)

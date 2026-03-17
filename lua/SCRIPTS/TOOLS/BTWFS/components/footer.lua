@@ -15,9 +15,16 @@ return function(ctx)
   local theme = ctx.theme
   local scale = ctx.scale
 
+  -- Cache theme values
+  local isColor    = theme.isColor
+  local C_subtext  = theme.C.subtext
+  local F_small    = theme.F.small
+  local F_SMALL_CC = F_small + CUSTOM_COLOR
+
   local PAD_L = scale.sx(15)  -- left padding for indicators
   local PAD_R = scale.sx(15)  -- right padding for pagination text
   local IND_GAP = scale.sx(18) -- horizontal gap between indicators
+  local BW_PAG_X = scale.sx(30) -- B&W pagination X offset
 
   local Footer = {}
   Footer.__index = Footer
@@ -34,17 +41,32 @@ return function(ctx)
     self._indicators = props.indicators or {}
     self._pageN      = 0
     self._pageT      = 0
+    self._pagText    = nil
+    self._pagTx      = 0  -- cached X position for pagination text
+    self._ty         = self.y + math.floor((self.h - theme.FH.small) / 2) - scale.sy(3)
+    self._bwPagX     = self.x + self.w - BW_PAG_X  -- B&W pagination X
     return self
   end
 
-  -- Called by the navigator each frame before render()
+  -- Called by the navigator on page change
   function Footer:setPagination(n, total)
     self._pageN = n
     self._pageT = total
+    if total > 0 then
+      self._pagText = n .. " / " .. total
+      if lcd.sizeText then
+        self._pagTw = lcd.sizeText(self._pagText, F_small)
+      else
+        self._pagTw = BW_PAG_X
+      end
+      self._pagTx = self.x + self.w - self._pagTw - PAD_R
+    else
+      self._pagText = nil
+    end
   end
 
   function Footer:render()
-    if theme.isColor then
+    if isColor then
       -- Background
       lcd.setColor(CUSTOM_COLOR, self.bgColor)
       lcd.drawFilledRectangle(self.x, self.y, self.w, self.h, CUSTOM_COLOR)
@@ -53,7 +75,7 @@ return function(ctx)
       lcd.drawFilledRectangle(self.x, self.y, self.w, self.lineH, CUSTOM_COLOR)
 
       -- Status indicators: same vertical position as pagination text
-      local ty = self.y + math.floor((self.h - theme.FH.small) / 2) - scale.sy(3)
+      local ty = self._ty
       local ix = self.x + PAD_L
       for _, dot in ipairs(self._indicators) do
         dot._x = ix
@@ -62,21 +84,15 @@ return function(ctx)
         ix = ix + dot:width() + IND_GAP
       end
 
-      -- Pagination text: "n / total" right-aligned, vertically centered
-      if self._pageT > 0 then
-        local txt  = self._pageN .. " / " .. self._pageT
-        local font = theme.F.small
-        local tw   = (lcd.sizeText and lcd.sizeText(txt, font)) or scale.sx(30)
-        local tx   = self.x + self.w - tw - PAD_R
-        local ty   = self.y + math.floor((self.h - theme.FH.small) / 2) - scale.sy(3)
-        lcd.setColor(CUSTOM_COLOR, theme.C.subtext)
-        lcd.drawText(tx, ty, txt, font + CUSTOM_COLOR)
+      -- Pagination text: X pre-computed in setPagination()
+      if self._pagText then
+        lcd.setColor(CUSTOM_COLOR, C_subtext)
+        lcd.drawText(self._pagTx, ty, self._pagText, F_SMALL_CC)
       end
     else
       lcd.drawLine(self.x, self.y, self.x + self.w - 1, self.y, SOLID, 0)
-      if self._pageT > 0 then
-        lcd.drawText(self.x + self.w - scale.sx(30), self.y + 2,
-                     self._pageN .. "/" .. self._pageT, SMLSIZE)
+      if self._pagText then
+        lcd.drawText(self._bwPagX, self.y + 2, self._pagText, SMLSIZE)
       end
     end
   end

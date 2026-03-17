@@ -43,6 +43,8 @@ Core capabilities:
 - Telemetry output routing (WiFi UDP / BLE / Off)
 - On-device configuration with persistence + controlled reboot flows
 - OTA firmware update from browser
+- WiFi IP address reported with mode label (`STATIC` for AP, `DHCP` for STA)
+- Local BLE MAC address visible in Lua Bluetooth page (uses persisted value from first boot onward)
 
 ---
 
@@ -72,6 +74,7 @@ Use this when you want to:
 - Scan/select WiFi networks and edit credentials
 - Manage BLE actions without leaving the transmitter
 - Keep all operational checks in one place during field use
+- View local BT MAC address and saved peer from the Bluetooth page
 
 ---
 

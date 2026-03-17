@@ -107,8 +107,8 @@ Typical pages include:
 
 - Dashboard
 - Settings
-- Bluetooth
-- WiFi (when available by mode/output)
+- Bluetooth — includes a read-only **Local Address** row showing the device's own BLE MAC, plus saved device and scan/connect actions
+- WiFi (when available by mode/output) — the **IP Address** row shows the actual assigned address with a mode suffix: `(STATIC)` for AP, `(DHCP)` for STA
 
 Use your radio wheel/keys to navigate, edit values, and confirm actions.
 
@@ -172,6 +172,7 @@ Availability and behavior depend on selected device mode and serial mode combina
 ### 6.2 Connect to BLE device
 
 1. Open Bluetooth page.
+   - The **Local Address** row at the top shows the device's own BLE MAC for reference.
 2. Start BLE scan.
 3. Select target from result list.
 4. Wait for connection completion.
@@ -250,6 +251,10 @@ Try:
 1. disconnect/forget,
 2. scan again,
 3. reconnect from fresh result list.
+
+### 8.5 Local BT address shows "--"
+
+This is normal for a brief moment after boot while the BLE stack is initializing. The address will populate automatically once initialization completes. If it never appears, verify the device has been used with BLE at least once so a MAC address has been persisted.
 
 ### 8.4 Web UI unreachable
 

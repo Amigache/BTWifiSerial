@@ -165,8 +165,15 @@ Current firmware status bits:
 | ID | Name | Type | Description |
 |---|---|---|---|
 | `0x01` | `FIRMWARE` | STRING | build timestamp |
-| `0x02` | `BT_ADDR` | STRING | local BLE address |
+| `0x02` | `BT_ADDR` | STRING | local BLE MAC address; falls back to the last persisted address (`g_config.localBtAddr`) while the BLE stack is still initializing |
 | `0x03` | `REM_ADDR` | STRING | saved remote address or `(none)` |
+| `0x04` | `WIFI_IP` | STRING | active WiFi IP with mode suffix: `"IP (STATIC)"` (AP), `"IP (DHCP)"` (STA connected), or `"(none)"` |
+
+### 5.5 RX frame size guard
+
+The firmware RX buffer is 80 bytes (`s_rxBuf[80]`), sized to accommodate the largest possible incoming payload: `PT_PREF_SET` with a 63-character `STA_PASS` (header 3 + type 1 + max value 63 = 67 bytes including CRC).
+
+If a received `LEN` field would require more bytes than the buffer can hold, the frame is dropped immediately with a warning log and the parser resets. Lua should never send oversized payloads; all current command types are well under this limit.
 
 ---
 

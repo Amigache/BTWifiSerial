@@ -17,10 +17,22 @@ return function(ctx)
   local theme = ctx.theme
   local scale = ctx.scale
 
+  -- Cache theme values
+  local isColor    = theme.isColor
+  local C_subtext  = theme.C.subtext
+  local F_small    = theme.F.small
+  local F_SMALL_CC = F_small + CUSTOM_COLOR
+
   local DOT_GAP = scale.sx(5)   -- gap between right edge of dot and label text
 
   local StatusDot = {}
   StatusDot.__index = StatusDot
+
+  local function computeWidth(self)
+    local tw = (lcd.sizeText and lcd.sizeText(self._label, F_small)) or
+               (#self._label * 7)
+    self._w = self._r * 2 + DOT_GAP + tw
+  end
 
   function StatusDot.new(props)
     local self   = setmetatable({}, StatusDot)
@@ -29,6 +41,7 @@ return function(ctx)
     self._y      = props.y
     self._r      = props.r or scale.s(4)
     self._color  = props.color or theme.C.subtext
+    computeWidth(self)
     return self
   end
 
@@ -38,36 +51,33 @@ return function(ctx)
 
   function StatusDot:setLabel(lbl)
     self._label = lbl
+    computeWidth(self)
   end
 
+  local _cyOff = math.floor(theme.FH.small / 2) + scale.sy(3)
+
   function StatusDot:render()
-    if not theme.isColor then
+    if not isColor then
       lcd.drawText(self._x, self._y, self._label, SMLSIZE)
       return
     end
 
     local r  = self._r
     local cx = self._x + r
-    -- _y = footer ty, which already has -sy(3) baked in for text rendering offset.
-    -- Add FH.small/2 + sy(3) so the circle lands at the true footer centre (same
-    -- as the text optical centre), cancelling the -sy(3) shift in ty.
-    local cy = self._y + math.floor(theme.FH.small / 2) + scale.sy(3)
+    local cy = self._y + _cyOff
 
     -- Filled circle
     lcd.setColor(CUSTOM_COLOR, self._color)
     lcd.drawFilledCircle(cx, cy, r, CUSTOM_COLOR)
 
-    -- Label text to the right, top-aligned with _y (same as footer ty)
-    local tx = self._x + r * 2 + DOT_GAP
-    lcd.setColor(CUSTOM_COLOR, theme.C.subtext)
-    lcd.drawText(tx, self._y, self._label, theme.F.small + CUSTOM_COLOR)
+    -- Label text to the right
+    lcd.setColor(CUSTOM_COLOR, C_subtext)
+    lcd.drawText(self._x + r * 2 + DOT_GAP, self._y, self._label, F_SMALL_CC)
   end
 
   -- Returns total pixel width of the component (dot diameter + gap + text)
   function StatusDot:width()
-    local tw = (lcd.sizeText and lcd.sizeText(self._label, theme.F.small)) or
-               (#self._label * 7)
-    return self._r * 2 + DOT_GAP + tw
+    return self._w
   end
 
   return StatusDot

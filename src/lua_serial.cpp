@@ -48,6 +48,8 @@ static uint32_t         s_lastWifiScanMs  = 0;
 
 // Telemetry output tracking
 static bool s_tlmOutputActive = false;
+static bool s_restartPending  = false;
+static char s_lastWifiIp[32]  = "";
 
 // ── RX state machine ────────────────────────────────────────────────
 // States: 0=wait-sync 1=ch 2=type 3=len 4=accumulate 5=crc
@@ -55,7 +57,7 @@ static uint8_t  s_rxState  = 0;
 static uint8_t  s_rxCh     = 0;
 static uint8_t  s_rxType   = 0;
 static uint8_t  s_rxLen    = 0;
-static uint8_t  s_rxBuf[48];   // max incoming payload (PREF_SET STRING: 1+1+1+15+padding)
+static uint8_t  s_rxBuf[80];   // max incoming payload: PREF_SET STA_PASS = 1+1+1+63 = 66 bytes
 static uint8_t  s_rxPos    = 0;
 static uint8_t  s_rxCrcAcc = 0;
 
@@ -66,6 +68,7 @@ extern void mainSetDeviceMode(uint8_t mode);
 extern void mainSetTelemOutput(uint8_t output);
 extern void mainSetMirrorBaud(uint32_t baud);
 extern void mainSetWifiMode(uint8_t mode);
+extern void mainRequestConfigRestart();
 // ── Generic frame sender ─────────────────────────────────────────────
 // Builds and sends: [SYNC][CH][TYPE][LEN][payload...][CRC]
 // CRC = XOR(CH ^ TYPE ^ LEN ^ payload[0..len-1])
@@ -283,6 +286,39 @@ static void sendInfoEnd() {
     sendFrame(LUA_CH_INFO, LUA_PT_INFO_END, nullptr, 0);
 }
 
+static void makeWifiIpText(char* out, size_t outSize) {
+    if (!out || outSize == 0) return;
+    out[0] = '\0';
+
+    if (s_apMode == 1 || s_apMode == 2) {
+        IPAddress ip = WiFi.softAPIP();
+        String s = ip.toString();
+        if (s.length() > 0 && s != "0.0.0.0") {
+            snprintf(out, outSize, "%s (STATIC)", s.c_str());
+        } else {
+            strlcpy(out, "(none)", outSize);
+        }
+        return;
+    }
+
+    if (s_apMode == 3) {
+        if (WiFi.isConnected()) {
+            IPAddress ip = WiFi.localIP();
+            String s = ip.toString();
+            if (s.length() > 0 && s != "0.0.0.0") {
+                snprintf(out, outSize, "%s (DHCP)", s.c_str());
+            } else {
+                strlcpy(out, "(none)", outSize);
+            }
+        } else {
+            strlcpy(out, "(none)", outSize);
+        }
+        return;
+    }
+
+    strlcpy(out, "(none)", outSize);
+}
+
 static void sendInfoItem(uint8_t id) {
     uint8_t buf[48];
     uint8_t pos = 0;
@@ -303,13 +339,21 @@ static void sendInfoItem(uint8_t id) {
         case LUA_INFO_BT_ADDR: {
             label = "BT Addr";
             const char* addr = bleGetLocalAddress();
-            strlcpy(val, addr ? addr : "?", sizeof(val));
+            // Fall back to the cached address persisted from the last BLE init.
+            // This ensures the field is populated even before BLE finishes starting.
+            if (!addr || addr[0] == '\0') addr = g_config.localBtAddr;
+            strlcpy(val, (addr && addr[0]) ? addr : "?", sizeof(val));
             break;
         }
         case LUA_INFO_REM_ADDR: {
             label = "Remote Addr";
             strlcpy(val, g_config.hasRemoteAddr ? g_config.remoteBtAddr : "(none)",
                     sizeof(val));
+            break;
+        }
+        case LUA_INFO_WIFI_IP: {
+            label = "WiFi IP";
+            makeWifiIpText(val, sizeof(val));
             break;
         }
         default: return;
@@ -322,7 +366,7 @@ static void sendInfoItem(uint8_t id) {
 
 static void sendInfoAll() {
     sendInfoBegin(LUA_INFO_COUNT);
-    for (uint8_t id = LUA_INFO_FIRMWARE; id <= LUA_INFO_REM_ADDR; id++) {
+    for (uint8_t id = LUA_INFO_FIRMWARE; id <= LUA_INFO_WIFI_IP; id++) {
         sendInfoItem(id);
     }
     sendInfoEnd();
@@ -343,12 +387,16 @@ static void sendInfoUpdate(uint8_t id) {
             break;
         case LUA_INFO_BT_ADDR: {
             const char* addr = bleGetLocalAddress();
-            strlcpy(val, addr ? addr : "?", sizeof(val));
+            if (!addr || addr[0] == '\0') addr = g_config.localBtAddr;
+            strlcpy(val, (addr && addr[0]) ? addr : "?", sizeof(val));
             break;
         }
         case LUA_INFO_REM_ADDR:
             strlcpy(val, g_config.hasRemoteAddr ? g_config.remoteBtAddr : "(none)",
                     sizeof(val));
+            break;
+        case LUA_INFO_WIFI_IP:
+            makeWifiIpText(val, sizeof(val));
             break;
         default: return;
     }
@@ -382,7 +430,7 @@ static void sendChannelFrame() {
 
 static void sendStatusFrame() {
     // bit0 = BLE connected,  bit1 = WiFi active (AP running OR STA connected),
-    // bit2 = BLE connecting
+    // bit2 = BLE connecting, bit3 = config changes pending restart
     uint8_t wifiActive = 0;
     if (s_apMode == 1 || s_apMode == 2) {
         wifiActive = 0x02;  // AP is up whenever we're in AP mode
@@ -391,7 +439,8 @@ static void sendStatusFrame() {
     }
     uint8_t status = (bleIsConnected()  ? 0x01 : 0x00)
                    | wifiActive
-                   | (bleIsConnecting() ? 0x04 : 0x00);
+                   | (bleIsConnecting() ? 0x04 : 0x00)
+                   | (s_restartPending  ? 0x08 : 0x00);
     sendFrame(LUA_CH_INFO, LUA_PT_INFO_STATUS, &status, 1);
 }
 
@@ -487,20 +536,29 @@ static void handlePrefSet(const uint8_t* payload, uint8_t len) {
             if (pos >= len) { sendPrefAck(id, 0x01); return; }
             uint8_t newIdx = payload[pos];
             if (newIdx > 2)  { sendPrefAck(id, 0x01); return; }
+            bool telemChanged = false;
 
             // Cascade: switching away from WiFi mode (Off) clears WiFi telem output
             if (newIdx == 0 && g_config.telemetryOutput == TelemetryOutput::WIFI_UDP) {
                 g_config.telemetryOutput = TelemetryOutput::NONE;
+                telemChanged = true;
                 configSave();
             }
             // Cascade: AP/STA mode can't coexist with BLE telem
             if (newIdx != 0 && g_config.telemetryOutput == TelemetryOutput::BLE) {
                 g_config.telemetryOutput = TelemetryOutput::NONE;
+                telemChanged = true;
                 configSave();
             }
 
             sendPrefAck(id, 0x00);
-            mainSetWifiMode(newIdx);  // saves config + selects boot mode + restarts
+            g_config.wifiMode = static_cast<WifiMode>(newIdx);
+            configSave();
+            sendPrefUpdate(LUA_PREF_WIFI_MODE);
+            if (telemChanged) {
+                sendPrefUpdate(LUA_PREF_TELEM_OUT);
+            }
+            s_restartPending = true;
             break;
         }
 
@@ -515,8 +573,11 @@ static void handlePrefSet(const uint8_t* payload, uint8_t len) {
                 configSave();
                 sendPrefUpdate(LUA_PREF_TELEM_OUT);
             }
+            g_config.deviceMode = static_cast<DeviceMode>(newIdx);
+            configSave();
             sendPrefAck(id, 0x00);
-            mainSetDeviceMode(newIdx);
+            sendPrefUpdate(LUA_PREF_DEV_MODE);
+            s_restartPending = true;
             break;
         }
 
@@ -524,16 +585,22 @@ static void handlePrefSet(const uint8_t* payload, uint8_t len) {
             if (pos >= len) { sendPrefAck(id, 0x01); return; }
             uint8_t newIdx = payload[pos];
             if (newIdx > 2) { sendPrefAck(id, 0x01); return; }
+            g_config.telemetryOutput = static_cast<TelemetryOutput>(newIdx);
+            configSave();
             sendPrefAck(id, 0x00);
-            mainSetTelemOutput(newIdx);
+            sendPrefUpdate(LUA_PREF_TELEM_OUT);
+            s_restartPending = true;
             break;
         }
 
         case LUA_PREF_MIRROR_BAUD: {
             if (pos >= len) { sendPrefAck(id, 0x01); return; }
             uint32_t baud = (payload[pos] == 1) ? 115200 : 57600;
+            g_config.sportBaud = baud;
+            configSave();
             sendPrefAck(id, 0x00);
-            mainSetMirrorBaud(baud);
+            sendPrefUpdate(LUA_PREF_MIRROR_BAUD);
+            s_restartPending = true;
             break;
         }
 
@@ -572,7 +639,8 @@ static void handlePrefSet(const uint8_t* payload, uint8_t len) {
             strlcpy(g_config.apSsid, str, sizeof(g_config.apSsid));
             configSave();
             sendPrefAck(id, 0x00);
-            ESP.restart();
+            sendPrefUpdate(LUA_PREF_AP_SSID);
+            s_restartPending = true;
             break;
         }
 
@@ -586,7 +654,8 @@ static void handlePrefSet(const uint8_t* payload, uint8_t len) {
             g_config.udpPort = port;
             configSave();
             sendPrefAck(id, 0x00);
-            ESP.restart();
+            sendPrefUpdate(LUA_PREF_UDP_PORT);
+            s_restartPending = true;
             break;
         }
 
@@ -599,7 +668,8 @@ static void handlePrefSet(const uint8_t* payload, uint8_t len) {
             strlcpy(g_config.apPass, str, sizeof(g_config.apPass));
             configSave();
             sendPrefAck(id, 0x00);
-            ESP.restart();
+            sendPrefUpdate(LUA_PREF_AP_PASS);
+            s_restartPending = true;
             break;
         }
 
@@ -625,10 +695,8 @@ static void handlePrefSet(const uint8_t* payload, uint8_t len) {
             strlcpy(g_config.staPass, str, sizeof(g_config.staPass));
             configSave();
             sendPrefAck(id, 0x00);
-            // Only restart if SSID exists and WiFi mode is STA
-            if (g_config.staSsid[0] != '\0' && g_config.wifiMode == WifiMode::STA) {
-                ESP.restart();
-            }
+            sendPrefUpdate(LUA_PREF_STA_PASS);
+            s_restartPending = true;
             break;
         }
 
@@ -707,6 +775,11 @@ static void dispatchRxFrame(uint8_t ch, uint8_t typ, const uint8_t* payload, uin
                 sendWifiScanStatusFrame(0, 0);
             }
             // else: scan already in progress, ignore duplicate request
+
+        } else if (typ == LUA_PT_INFO_RESTART) {
+            LOG_I("LUA", "Restart requested by tools");
+            s_restartPending = false;
+            mainRequestConfigRestart();
         }
 
     } else if (ch == LUA_CH_TRANS) {
@@ -740,7 +813,13 @@ static void processRxByte(uint8_t b) {
             s_rxLen    = b;
             s_rxCrcAcc ^= b;
             s_rxPos    = 0;
-            s_rxState  = (s_rxLen == 0) ? 5 : 4;
+            if (s_rxLen > sizeof(s_rxBuf)) {
+                LOG_W("LUA", "RX oversized LEN=%u (max %u), frame dropped",
+                      s_rxLen, (unsigned)sizeof(s_rxBuf));
+                s_rxState = 0;
+            } else {
+                s_rxState = (s_rxLen == 0) ? 5 : 4;
+            }
             break;
 
         case 4:  // accumulate payload
@@ -852,6 +931,13 @@ void luaSerialLoop() {
                 s_lastBleConnected = connected;
                 sendInfoUpdate(LUA_INFO_REM_ADDR);
             }
+        }
+
+        char wifiIp[32] = {};
+        makeWifiIpText(wifiIp, sizeof(wifiIp));
+        if (strncmp(wifiIp, s_lastWifiIp, sizeof(s_lastWifiIp)) != 0) {
+            strlcpy(s_lastWifiIp, wifiIp, sizeof(s_lastWifiIp));
+            sendInfoUpdate(LUA_INFO_WIFI_IP);
         }
     }
 
