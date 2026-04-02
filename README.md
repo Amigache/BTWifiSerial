@@ -26,6 +26,7 @@ It lets you run trainer, telemetry, and configuration workflows through one devi
 - [Runtime roles of Lua scripts](#runtime-roles-of-lua-scripts)
 - [Troubleshooting quick checks](#troubleshooting-quick-checks)
 - [Factory reset (Web UI)](#factory-reset-web-ui)
+- [ELRS head tracking](#elrs-head-tracking)
 - [Documentation](#documentation)
 - [Notes for maintainers](#notes-for-maintainers)
 
@@ -93,6 +94,7 @@ Use this when you want to:
 - `trainer_in` (BLE central)
 - `trainer_out` (BLE peripheral)
 - `telemetry`
+- `elrs_ht` (ELRS Backpack head tracking via ESP-NOW)
 
 ### WiFi modes
 
@@ -256,6 +258,23 @@ Important default values after reset:
 - WiFi Mode: `Off`
 
 After reset, you can still enter AP mode manually (BOOT button) or configure from the radio Lua UI.
+
+---
+
+## ELRS head tracking
+
+Receive head tracking (pan/tilt/roll) from an ELRS Backpack VRx (e.g., HDZero goggles) via ESP-NOW.
+
+### Setup
+
+In Lua Tools **Settings**:
+
+1. Set **Device Mode** to **ELRS HT**
+2. Set **ELRS Phrase** to match your ELRS Binding Phrase
+
+Accept the restart when prompted.
+
+Head tracking values are injected into **GV1** (pan), **GV2** (tilt), **GV3** (roll). Use these as mixer sources. WiFi, BLE, and telemetry are automatically disabled while in ELRS HT mode.
 
 ---
 

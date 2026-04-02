@@ -122,15 +122,39 @@ local function _updateDotBLE(connected, connecting)
   end
 end
 
+local _dotELRS = StatusDot.new({ label = "ELRS HT", x = 0, y = 0 })
+
+local function _updateDotELRS(receiving)
+  _dotELRS:setColor(receiving and theme.C.green or theme.C.red)
+end
+
+-- Build indicator list based on device mode; updated when prefs arrive
+local function _rebuildIndicators()
+  local devPref = store.prefs and store.prefs[0x02]
+  local isElrs = devPref and devPref.curIdx == 3
+  if isElrs then
+    _indicators[3] = _dotELRS
+  else
+    _indicators[3] = _dotBLE
+  end
+end
+
 -- Initialise all dots to disconnected state
 _updateDotBoard(false)
 _updateDotWifi(false)
 _updateDotBLE(false, false)
+_updateDotELRS(false)
 
 -- React to status frames from ESP32
 store.on("status", function(s)
   _updateDotWifi(s.wifiClients)
   _updateDotBLE(s.bleConnected, s.bleConnecting)
+  _updateDotELRS(s.bleConnected)  -- bit0 = ELRS receiving in ELRS mode
+end)
+
+-- Swap BLE/ELRS indicator when prefs arrive
+store.on("prefs_ready", function()
+  _rebuildIndicators()
 end)
 
 -- Re-evaluate WiFi dot when prefs arrive or WiFi Mode pref changes

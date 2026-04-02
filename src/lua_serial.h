@@ -73,6 +73,7 @@
  *   0x09  AP_PASS     STRING maxLen=15  PF_RESTART
  *   0x0A  STA_SSID    STRING maxLen=31  PF_RESTART
  *   0x0B  STA_PASS    STRING maxLen=63  PF_RESTART
+ *   0x0C  ELRS_BIND   STRING maxLen=31  PF_RESTART — ELRS binding phrase
  *
  * Info IDs:
  *   0x01  FIRMWARE  STRING  build timestamp "DDMMYYYY HHMM"
@@ -160,7 +161,8 @@ static constexpr uint8_t LUA_PREF_UDP_PORT    = 0x08;
 static constexpr uint8_t LUA_PREF_AP_PASS     = 0x09;
 static constexpr uint8_t LUA_PREF_STA_SSID    = 0x0A;
 static constexpr uint8_t LUA_PREF_STA_PASS    = 0x0B;
-static constexpr uint8_t LUA_PREF_COUNT       = 11;
+static constexpr uint8_t LUA_PREF_ELRS_BIND   = 0x0C;  ///< STRING maxLen=31 — ELRS binding phrase
+static constexpr uint8_t LUA_PREF_COUNT       = 12;
 
 // ── Info IDs ─────────────────────────────────────────────────────────
 static constexpr uint8_t LUA_INFO_FIRMWARE = 0x01;
@@ -170,7 +172,7 @@ static constexpr uint8_t LUA_INFO_WIFI_IP  = 0x04;
 static constexpr uint8_t LUA_INFO_COUNT    = 4;
 
 // ── Timing ───────────────────────────────────────────────────────────
-static constexpr uint32_t LUA_CH_FRAME_INTERVAL  = 10;     // ms — ~100 Hz channel TX
+static constexpr uint32_t LUA_CH_FRAME_INTERVAL  = 20;     // ms — 50 Hz channel TX
 static constexpr uint32_t LUA_STATUS_INTERVAL    = 500;    // ms
 static constexpr uint32_t LUA_CFG_INTERVAL       = 30000;  // ms — periodic full resync
 static constexpr uint32_t LUA_TOOLS_IDLE_TIMEOUT = 15000;  // ms — stop heavy TX when idle

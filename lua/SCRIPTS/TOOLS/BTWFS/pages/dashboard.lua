@@ -181,7 +181,7 @@ return function(ctx)
   end
 
   function Dashboard:render()
-    -- Refresh channel bars from store (polled — channels arrive ~100 Hz)
+    -- Refresh channel bars from store (polled — channels arrive ~50 Hz)
     for i = 1, 8 do
       if self._bars[i] then
         self._bars[i]:setValue(store.channels[i] or 0)

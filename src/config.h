@@ -44,7 +44,8 @@ enum class TelemetryOutput : uint8_t {
 enum class DeviceMode : uint8_t {
     TRAINER_IN  = 0,  // BLE Central: receive channels from a remote device
     TRAINER_OUT = 1,  // BLE Peripheral: send radio channels to a remote device
-    TELEMETRY   = 2   // Telemetry relay: forward S.PORT via WiFi UDP or BLE
+    TELEMETRY   = 2,  // Telemetry relay: forward S.PORT via WiFi UDP or BLE
+    ELRS_HT     = 3   // ELRS Backpack: receive head tracking via ESP-NOW
 };
 
 // ─── Trainer channel mapping mode ───────────────────────────────────
@@ -80,6 +81,9 @@ struct Config {
     char            staSsid[32];         // STA SSID to connect to (max 31 + null)
     char            staPass[64];         // STA password (max 63 + null)
 
+    // ELRS Backpack head tracking
+    char            elrsBindPhrase[32];  // ELRS binding phrase (max 31 chars + null)
+
     void setDefaults() {
         serialMode      = OutputMode::LUA_SERIAL;
         deviceMode      = DeviceMode::TRAINER_IN;
@@ -97,6 +101,7 @@ struct Config {
         strlcpy(apPass, "12345678", sizeof(apPass));
         memset(staSsid, 0, sizeof(staSsid));
         memset(staPass, 0, sizeof(staPass));
+        strlcpy(elrsBindPhrase, "123456", sizeof(elrsBindPhrase));
     }
 };
 

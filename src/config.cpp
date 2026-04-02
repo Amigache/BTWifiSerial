@@ -56,6 +56,10 @@ void configLoad() {
     String staPass = prefs.getString("staPass", "");
     strlcpy(g_config.staPass, staPass.c_str(), sizeof(g_config.staPass));
 
+    // ELRS Backpack settings
+    String elrsBind = prefs.getString("elrsBind", "123456");
+    strlcpy(g_config.elrsBindPhrase, elrsBind.c_str(), sizeof(g_config.elrsBindPhrase));
+
     prefs.end();
 
     const char* modeStr = "FrSky";
@@ -69,6 +73,7 @@ void configLoad() {
     switch (g_config.deviceMode) {
         case DeviceMode::TRAINER_OUT: devStr = "Trainer OUT"; break;
         case DeviceMode::TELEMETRY:   devStr = "Telemetry";   break;
+        case DeviceMode::ELRS_HT:     devStr = "ELRS HT";     break;
         default: break;
     }
     LOG_I("CFG", "Loaded: mode=%s dev=%s name=%s", modeStr, devStr, g_config.btName);
@@ -109,6 +114,9 @@ void configSave() {
     prefs.putString("apPass", g_config.apPass);
     prefs.putString("staSsid", g_config.staSsid);
     prefs.putString("staPass", g_config.staPass);
+
+    // ELRS Backpack settings
+    prefs.putString("elrsBind", g_config.elrsBindPhrase);
 
     prefs.end();
 

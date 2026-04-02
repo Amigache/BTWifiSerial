@@ -27,6 +27,7 @@
 #include "sport_telemetry.h"
 #include "lua_serial.h"
 #include "web_ui.h"
+#include "elrs_espnow.h"
 
 // ───────── Runtime log level (defined here, declared extern in log.h) ─────────
 uint8_t g_logLevel = LOG_LEVEL;
@@ -157,7 +158,11 @@ void loop() {
 
     switch (s_appMode) {
         case AppMode::NORMAL:
-            bleLoop();
+            if (g_config.deviceMode == DeviceMode::ELRS_HT) {
+                elrsLoop();
+            } else {
+                bleLoop();
+            }
             if (s_serialActive) {
                 switch (g_config.serialMode) {
                     case OutputMode::FRSKY:        frskySerialLoop();    break;
@@ -202,6 +207,16 @@ void loop() {
 static void startNormalMode() {
     LOG_I("MAIN", ">>> NORMAL MODE <<<");
     LOG_D("MAIN", "Free heap: %u", ESP.getFreeHeap());
+
+    // ELRS_HT mode: uses WiFi for ESP-NOW — no BLE, no WiFi AP/STA
+    if (g_config.deviceMode == DeviceMode::ELRS_HT) {
+        LOG_I("MAIN", "ELRS_HT mode: starting ESP-NOW receiver");
+        elrsInit();
+        startSerialOutput();
+        s_appMode = AppMode::NORMAL;
+        LOG_D("MAIN", "ELRS_HT mode running, heap: %u", ESP.getFreeHeap());
+        return;
+    }
 
     // LUA_SERIAL + WiFi UDP output → must run Telemetry AP mode
     // (WiFi AP + web UI + LuaSerial, no BLE).  Redirect here so the Lua script
@@ -397,6 +412,14 @@ void mainRequestNormalMode() {
  */
 void mainSetDeviceMode(uint8_t mode) {
     g_config.deviceMode = static_cast<DeviceMode>(mode);
+
+    // ELRS_HT uses WiFi radio exclusively — force WiFi/telemetry off, trainer map to GV
+    if (g_config.deviceMode == DeviceMode::ELRS_HT) {
+        g_config.wifiMode = WifiMode::OFF;
+        g_config.telemetryOutput = TelemetryOutput::NONE;
+        g_config.trainerMapMode = TrainerMapMode::MAP_GV;
+    }
+
     configSave();
 
     // If Telemetry + WiFi UDP, need Telemetry AP boot mode
@@ -480,10 +503,16 @@ static void handleButton() {
                 uint32_t dur = millis() - s_buttonPressTime;
                 LOG_D("MAIN", "Boot button released after %lu ms", dur);
                 if (dur < SHORT_PRESS_MAX) {
-                    // Short press â†’ switch mode via restart
-                    switchModeTo(s_appMode == AppMode::NORMAL
-                                    ? AppMode::AP_MODE
-                                    : AppMode::NORMAL);
+                    // ELRS_HT uses WiFi for ESP-NOW — AP mode not available
+                    if (g_config.deviceMode == DeviceMode::ELRS_HT) {
+                        LOG_I("MAIN", "AP mode disabled in ELRS_HT mode");
+                        blinkLed(1, 200, 0);
+                    } else {
+                        // Short press → switch mode via restart
+                        switchModeTo(s_appMode == AppMode::NORMAL
+                                        ? AppMode::AP_MODE
+                                        : AppMode::NORMAL);
+                    }
                 }
                 s_buttonHandled = true;
             }
@@ -506,6 +535,18 @@ static void updateLed() {
             s_lastLedToggle = now;
             s_ledState = !s_ledState;
             digitalWrite(PIN_LED, s_ledState ? LOW : HIGH);
+        }
+        return;
+    }
+
+    // ELRS mode: solid ON when receiving, OFF otherwise
+    if (g_config.deviceMode == DeviceMode::ELRS_HT) {
+        if (elrsIsReceiving()) {
+            s_ledState = true;
+            digitalWrite(PIN_LED, LOW);
+        } else {
+            s_ledState = false;
+            digitalWrite(PIN_LED, HIGH);
         }
         return;
     }

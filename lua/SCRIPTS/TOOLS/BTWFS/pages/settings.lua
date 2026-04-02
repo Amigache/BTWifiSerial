@@ -36,6 +36,7 @@ return function(ctx)
     [0x09] = true, -- AP Password
     [0x0A] = true, -- STA SSID
     [0x0B] = true, -- STA Password
+    [0x0C] = true, -- ELRS Bind Phrase
   }
 
   -- ── Event helpers ─────────────────────────────────────────────────

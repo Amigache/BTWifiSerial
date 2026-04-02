@@ -318,6 +318,16 @@ return function(ctx)
   end
 
   function Bluetooth:handleEvent(event)
+    -- ELRS mode: no BLE operations available
+    local devPref = store.prefs[0x02]
+    if devPref and devPref.curIdx == 3 then
+      if self._modal then
+        self._modal:handleEvent(event)
+        return true
+      end
+      return false
+    end
+
     -- Modal takes priority
     if self._modal then
       self._modal:handleEvent(event)
@@ -470,6 +480,25 @@ return function(ctx)
   function Bluetooth:render()
     -- Render Page shell (background + header + page title + footer + section headers)
     self._page:render()
+
+    -- ── ELRS mode: Bluetooth not available ───────────────────────
+    local devPref = store.prefs[0x02]
+    if devPref and devPref.curIdx == 3 then
+      local msgY = self._page.contentY + scale.sy(30)
+      if isColor then
+        lcd.setColor(CUSTOM_COLOR, C_subtext)
+        lcd.drawText(LABEL_X, msgY, "Bluetooth not available", F_SMALL_CC)
+        lcd.drawText(LABEL_X, msgY + theme.FH.small + scale.sy(4),
+                     "ELRS mode uses WiFi radio", F_SMALL_CC)
+      else
+        lcd.drawText(PAD, msgY, "BT N/A (ELRS mode)", SMLSIZE)
+      end
+      if self._modal then
+        self._modal:render()
+        if not self._modal:isOpen() then self._modal = nil end
+      end
+      return
+    end
 
     -- ── Saved Device row ─────────────────────────────────────────
     local addr    = remoteAddr()
