@@ -788,6 +788,13 @@ static void handleWebSocketMessage(AsyncWebSocketClient* client, uint8_t* data, 
                       : TrainerMapMode::MAP_GV;
       }
 
+      // ELRS_HT uses WiFi radio exclusively — force WiFi/telemetry off, trainer map to GV
+      if (g_config.deviceMode == DeviceMode::ELRS_HT) {
+        g_config.wifiMode       = WifiMode::OFF;
+        g_config.telemetryOutput = TelemetryOutput::NONE;
+        g_config.trainerMapMode = TrainerMapMode::MAP_GV;
+      }
+
       bool restartNow = doc["restartNow"] | false;
       LOG_I("WEB", "System config saved%s", restartNow ? " — restarting" : " (pending restart)");
       configSave();
