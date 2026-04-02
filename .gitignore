@@ -5,4 +5,3 @@
 .vscode/ipch
 .DS_Store
 build_timestamp.txt
-src/build_ts_gen.h
